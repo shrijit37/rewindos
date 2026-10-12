@@ -292,6 +292,12 @@ export function AITab({ config, update }: TabProps) {
               )}
             </div>
           </Field>
+          <div className="py-3.5 border-b border-line">
+            <p className="font-mono text-[11px] text-signal-paused leading-relaxed max-w-[72ch]">
+              Privacy: your screenshot text is sent to your endpoint for embedding.
+              Do not use with sensitive content unless you trust the provider.
+            </p>
+          </div>
         </>
       )}
     </>

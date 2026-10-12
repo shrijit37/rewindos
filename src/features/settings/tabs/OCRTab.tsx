@@ -173,6 +173,12 @@ export function OCRTab({ config, update }: TabProps) {
               Transcription only — no word-level overlays; no local OCR binary is used.
             </span>
           </Field>
+          <div className="py-3.5 border-b border-line">
+            <p className="font-mono text-[11px] text-signal-paused leading-relaxed max-w-[72ch]">
+              Privacy: every captured screenshot is uploaded to your endpoint for transcription.
+              Do not use with sensitive content unless you trust the provider.
+            </p>
+          </div>
         </>
       )}
       <Field
