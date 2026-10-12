@@ -49,11 +49,18 @@ enum Command {
         #[arg(long, default_value = "50")]
         batch_size: usize,
     },
-    /// Re-run OCR on all screenshots using PaddleOCR (replacing Tesseract results)
+    /// Re-run OCR on screenshots using the configured engine, replacing
+    /// existing results (e.g. upgrading Tesseract output to gateway OCR)
     BackfillOcr {
         /// Number of screenshots to process per batch
         #[arg(long, default_value = "50")]
         batch_size: usize,
+        /// Only process screenshots that have no OCR text at all. Use this to
+        /// clear the backlog captured while OCR was disabled; the default
+        /// re-runs every screenshot in id order, reaching that backlog only
+        /// after reprocessing everything older.
+        #[arg(long)]
+        missing_only: bool,
     },
     /// Recompress existing screenshots with lossy WebP + downscaling
     Recompress {
@@ -96,7 +103,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Resume => dbus_client_call("Resume").await,
         Command::Status => dbus_client_status().await,
         Command::Backfill { batch_size } => run_backfill(batch_size).await,
-        Command::BackfillOcr { batch_size } => run_backfill_ocr(batch_size).await,
+        Command::BackfillOcr { batch_size, missing_only } => run_backfill_ocr(batch_size, missing_only).await,
         Command::Recompress {
             quality,
             max_width,
@@ -252,7 +259,7 @@ async fn run_backfill(batch_size: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_backfill_ocr(batch_size: usize) -> anyhow::Result<()> {
+async fn run_backfill_ocr(batch_size: usize, missing_only: bool) -> anyhow::Result<()> {
     init_logging();
 
     let config = AppConfig::load()?;
@@ -337,7 +344,7 @@ async fn run_backfill_ocr(batch_size: usize) -> anyhow::Result<()> {
         let pending = db
             .lock()
             .unwrap()
-            .get_screenshots_for_ocr_backfill(cursor, batch_size)?;
+            .get_screenshots_for_ocr_backfill(cursor, batch_size, missing_only)?;
         if pending.is_empty() {
             break;
         }

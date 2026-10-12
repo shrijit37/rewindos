@@ -795,21 +795,24 @@ impl Database {
     /// lost to an old crash) stay 'pending' forever and are otherwise
     /// unreachable by any backfill.
     ///
-    /// `after_id` is a cursor: backfill re-runs the same rows repeatedly (they
-    /// return to 'done' after a successful pass), so without it the command
-    /// re-processes every screenshot forever and never terminates.
+    /// `missing_only` narrows the queue to screenshots with no text at all —
+    /// the backlog captured while OCR was disabled or lost to a crash. The
+    /// default pass walks every screenshot in id order, so that backlog would
+    /// otherwise wait behind every older, already-indexed screenshot.
     pub fn get_screenshots_for_ocr_backfill(
         &self,
         after_id: i64,
         limit: usize,
+        missing_only: bool,
     ) -> Result<Vec<(i64, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, file_path FROM screenshots
              WHERE ocr_status IN ('pending', 'done', 'failed')
                AND id > ?1
+               AND (?3 = 0 OR id NOT IN (SELECT screenshot_id FROM ocr_text_content))
              ORDER BY id LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![after_id, limit as i64], |row| {
+        let rows = stmt.query_map(params![after_id, limit as i64, missing_only as i64], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?;
         let mut results = Vec::new();
@@ -4218,11 +4221,11 @@ mod tests {
             db.update_ocr_status(id, OcrStatus::Done).unwrap();
         }
 
-        let first = db.get_screenshots_for_ocr_backfill(0, 2).unwrap();
+        let first = db.get_screenshots_for_ocr_backfill(0, 2, false).unwrap();
         assert_eq!(first.len(), 2);
         // Without the cursor these same 'done' rows return on every pass.
         let cursor = first.last().unwrap().0;
-        let second = db.get_screenshots_for_ocr_backfill(cursor, 2).unwrap();
+        let second = db.get_screenshots_for_ocr_backfill(cursor, 2, false).unwrap();
         assert_eq!(second.len(), 1);
         assert!(second[0].0 > cursor);
     }
@@ -4236,8 +4239,26 @@ mod tests {
             OcrStatus::Pending
         );
 
-        let queued = db.get_screenshots_for_ocr_backfill(0, 10).unwrap();
+        let queued = db.get_screenshots_for_ocr_backfill(0, 10, false).unwrap();
         assert_eq!(queued.len(), 1, "pending rows are the bulk of an unbackfilled library");
+    }
+
+    #[test]
+    fn ocr_backfill_missing_only_skips_already_indexed_rows() {
+        let db = make_test_db();
+        // Old, already indexed, low id — would otherwise come first.
+        let indexed = db.insert_screenshot(&make_screenshot(1000)).unwrap();
+        db.insert_ocr_text(indexed, "existing text", 2).unwrap();
+        db.update_ocr_status(indexed, OcrStatus::Done).unwrap();
+        // The stranded backlog: no text, higher id.
+        let stranded = db.insert_screenshot(&make_screenshot(2000)).unwrap();
+
+        let queue = db.get_screenshots_for_ocr_backfill(0, 10, true).unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(
+            queue[0].0, stranded,
+            "missing-only must reach the backlog before redoing indexed rows"
+        );
     }
 
     #[test]
@@ -4245,7 +4266,7 @@ mod tests {
         let db = make_test_db();
         let id = db.insert_screenshot(&make_screenshot(1000)).unwrap();
         db.update_ocr_status(id, OcrStatus::Processing).unwrap();
-        assert!(db.get_screenshots_for_ocr_backfill(0, 10).unwrap().is_empty());
+        assert!(db.get_screenshots_for_ocr_backfill(0, 10, false).unwrap().is_empty());
     }
 
     #[test]

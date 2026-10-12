@@ -392,6 +392,9 @@ A failure now costs only a status change — the previous text stays searchable.
 - **Rebuilds embeddings**: replacing OCR text invalidates the vector describing it, so the
   row is re-queued (`embedding_status = 'pending'`) rather than left stale. Follow up with
   `rewindos-daemon backfill`.
+- **`--missing-only`**: processes only screenshots with no text at all. The default pass
+  walks every screenshot in id order, so the never-OCR'd backlog would otherwise wait
+  behind every older, already-indexed screenshot.
 
 ## Shutdown Sequence
 
