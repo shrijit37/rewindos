@@ -1,4 +1,6 @@
+import { useState } from "react";
 import type { CaptureVerdict, VerdictCode } from "../deriveCaptureVerdict";
+import { setupProfile, type SetupProfileId } from "../setup-profiles";
 import { Button } from "@/components/ui/button";
 
 const CLOSING: Record<VerdictCode, string> = {
@@ -25,12 +27,44 @@ const CLOSING: Record<VerdictCode, string> = {
 interface FinishStepProps {
   verdict: CaptureVerdict;
   onStartTour: () => void;
+  profile: SetupProfileId | null;
+  restartNeeded: boolean;
+  onRestartDaemon: () => Promise<void>;
 }
 
-export function FinishStep({ verdict, onStartTour }: FinishStepProps) {
+export function FinishStep({
+  verdict,
+  onStartTour,
+  profile,
+  restartNeeded,
+  onRestartDaemon,
+}: FinishStepProps) {
+  const [restart, setRestart] = useState<"idle" | "pending" | "done" | "error">("idle");
+  const [restartError, setRestartError] = useState<string | null>(null);
+  const chosen = profile ? setupProfile(profile) : null;
+
+  const restartDaemonNow = async () => {
+    setRestart("pending");
+    setRestartError(null);
+    try {
+      await onRestartDaemon();
+      setRestart("done");
+    } catch (e) {
+      setRestart("error");
+      setRestartError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
   return (
     <div className="flex flex-col gap-4">
       <h2 className="text-xl font-semibold text-text-primary">You're ready</h2>
+      {chosen && (
+        <p className="text-sm text-text-secondary">
+          Setup: <span className="font-medium text-text-primary">{chosen.name}</span> —{" "}
+          {chosen.tagline}
+        </p>
+      )}
+
       <p className="text-sm leading-relaxed text-text-secondary">{CLOSING[verdict.code]}</p>
 
       <div className="flex flex-col gap-2 rounded-md border border-border/50 bg-background/40 p-4 text-sm text-text-secondary">
@@ -45,6 +79,7 @@ export function FinishStep({ verdict, onStartTour }: FinishStepProps) {
         </div>
       </div>
 
+
       <div className="flex flex-col gap-2 rounded-md border border-border/50 bg-background/40 p-4 text-sm text-text-secondary">
         <p>
           Press{" "}
@@ -58,6 +93,26 @@ export function FinishStep({ verdict, onStartTour }: FinishStepProps) {
           privacy, and AI features.
         </p>
       </div>
+      {restartNeeded && chosen && (
+        <div className="flex flex-col gap-2 rounded-md border border-border/50 bg-background/40 p-4 text-sm text-text-secondary">
+          <p className="leading-relaxed">
+            RewindOS applies the capture pipeline immediately. OCR, semantic search, chat and
+            meetings are read when the daemon starts — restart it to pick up {chosen.name}.
+          </p>
+          <div>
+            <Button size="sm" onClick={() => void restartDaemonNow()} disabled={restart === "pending"}>
+              Restart daemon
+            </Button>
+          </div>
+          {restart !== "idle" && (
+            <p className="font-mono text-[11px] text-text-muted">
+              {restart === "pending" && "Restarting…"}
+              {restart === "done" && "Daemon restarted"}
+              {restart === "error" && (restartError ?? "restart failed")}
+            </p>
+          )}
+        </div>
+      )}
     </div>
   );
 }

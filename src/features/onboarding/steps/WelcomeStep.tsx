@@ -12,7 +12,8 @@ export function WelcomeStep() {
         No account, no telemetry.
       </p>
       <p className="text-xs text-text-muted">
-        Next, we'll make sure capture is actually working on your setup.
+        Next, tell us how much should run on your machine — then we'll make sure
+        capture is actually working.
       </p>
     </div>
   );

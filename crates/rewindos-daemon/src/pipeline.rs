@@ -17,6 +17,12 @@ use crate::capture::gate::CaptureGate;
 use crate::capture::{CaptureBackend, CaptureError, CaptureManager};
 use crate::window_info::SharedProvider;
 
+/// Retries for a single OCR attempt before the screenshot is marked failed.
+/// Remote backends intermittently return 502/503 or drop connections when
+/// several requests arrive at once; a local engine effectively never fails,
+/// so this costs local users nothing.
+const OCR_RETRY_ATTEMPTS: u32 = 3;
+
 /// Shared pipeline metrics, accessible from D-Bus GetStatus.
 pub struct PipelineMetrics {
     pub frames_captured: AtomicU64,
@@ -486,7 +492,11 @@ async fn run_ocr_stage(
                 .await;
             }
 
-            let result = ocr::run_ocr(
+            // Remote OCR backends rate-limit under concurrency (the gateway
+            // returns 502/503 and can drop connections), and one blip must
+            // not strand a screenshot: the live pipeline only ever sees the
+            // frame once, so 'failed' here is effectively permanent.
+            let mut result = ocr::run_ocr(
                 &effective_engine,
                 &frame.file_path,
                 &lang,
@@ -495,6 +505,29 @@ async fn run_ocr_stage(
                 gateway_client.as_deref(),
             )
             .await;
+
+            for attempt in 1..=OCR_RETRY_ATTEMPTS {
+                if result.is_ok() {
+                    break;
+                }
+                let delay = std::time::Duration::from_secs(2u64 << (attempt - 1));
+                warn!(
+                    screenshot_id = frame.screenshot_id,
+                    attempt,
+                    ?delay,
+                    "OCR failed, retrying"
+                );
+                tokio::time::sleep(delay).await;
+                result = ocr::run_ocr(
+                    &effective_engine,
+                    &frame.file_path,
+                    &lang,
+                    paddle_sidecar.as_ref(),
+                    api_client.as_deref(),
+                    gateway_client.as_deref(),
+                )
+                .await;
+            }
 
             match result {
                 Ok(output) => {

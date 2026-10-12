@@ -135,6 +135,9 @@ be an empty string (stored as untitled). Returns the new meeting id.
 - `com.rewindos.Error.AlreadyRunning` — a meeting is already being recorded
 - `com.rewindos.Error.ModelNotAvailable` — no Whisper GGUF model is installed
 - `com.rewindos.Error.AudioCaptureFailed` — audio capture streams could not be opened
+- `com.rewindos.Error.Failed` — `meeting.enabled` is false in `config.toml`.
+  The daemon reloads the config on every call, so a setup profile applied in the
+  UI takes effect without a restart. Enable it in Settings → Meetings.
 
 ### StopMeeting()
 

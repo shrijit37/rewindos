@@ -5,6 +5,7 @@ import { queryKeys } from "@/lib/query-keys";
 import type { AppConfig } from "@/lib/config";
 import { useConfigQuery } from "@/hooks/useConfigQuery";
 import { useDebounce } from "@/hooks/useDebounce";
+import type { SetupPatch } from "@/features/onboarding/setup-profiles";
 
 const AUTOSAVE_DELAY_MS = 800;
 
@@ -94,6 +95,25 @@ export function useConfig() {
     [fetchedConfig],
   );
 
+  // Apply several sections at once (e.g. one setup-profile click writing setup +
+  // ocr + semantic + chat). Shallow-merges each section onto the current base,
+  // so untouched keys survive. The debounced save sends the whole config, so
+  // every key in one call coalesces into a single write.
+  const patch = useCallback((next: SetupPatch) => {
+    setLocalEdits((prev) => {
+      const base = prev ?? fetchedConfig ?? null;
+      if (!base) return prev;
+      // Spread the base first: updateConfig ships the WHOLE config, so a
+      // patch that rebuilt the object from `next` alone would drop every
+      // section it doesn't mention (capture, storage, ui, …).
+      const merged: Record<string, object> = { ...base };
+      for (const [section, fields] of Object.entries(next)) {
+        merged[section] = { ...merged[section], ...(fields as object) };
+      }
+      return merged as unknown as AppConfig;
+    });
+  }, [fetchedConfig]);
+
   return {
     config,
     saving: saveMutation.isPending,
@@ -101,5 +121,6 @@ export function useConfig() {
     error: saveMutation.error ? String(saveMutation.error) : fetchError ? String(fetchError) : null,
     flush,
     update,
+    patch,
   };
 }

@@ -1,24 +1,29 @@
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useHotkey } from "@tanstack/react-hotkeys";
 import {
   getDaemonStatus,
   openExtensionPage,
   recheckWindowInfo,
+  restartDaemon,
   resumeCapture,
   setUnfilteredCapture,
+  whisperModelPresent,
 } from "@/lib/api";
 import { queryKeys } from "@/lib/query-keys";
 import { useOnboarding } from "./OnboardingContext";
 import { useTour } from "@/features/tour/TourContext";
 import { deriveCaptureVerdict, type VerdictAction } from "./deriveCaptureVerdict";
+import { setupPatch, type SetupProfileId } from "./setup-profiles";
+import { useConfig } from "@/features/settings/hooks/useConfig";
 import { WizardShell } from "./WizardShell";
+import { SetupStep } from "./steps/SetupStep";
 import { WelcomeStep } from "./steps/WelcomeStep";
 import { CaptureStep } from "./steps/CaptureStep";
 import { PrivacyStep } from "./steps/PrivacyStep";
 import { FinishStep } from "./steps/FinishStep";
 
-const STEPS = ["welcome", "capture", "privacy", "finish"] as const;
+const STEPS = ["welcome", "setup", "capture", "privacy", "finish"] as const;
 
 // Thin gate: WizardBody only mounts while open, so its step state resets
 // naturally on reopen (no manual reset needed), and its status poll stops
@@ -34,6 +39,15 @@ function WizardBody() {
   const { start: startTour } = useTour();
   const [stepIndex, setStepIndex] = useState(0);
   const [busy, setBusy] = useState(false);
+  const [profile, setProfile] = useState<SetupProfileId | null>(null);
+  const applied = useRef(false);
+  const { config, patch } = useConfig();
+  const { data: whisperPresent } = useQuery({
+    queryKey: queryKeys.whisperModel(),
+    queryFn: whisperModelPresent,
+    staleTime: 10_000,
+    retry: false,
+  });
   const qc = useQueryClient();
 
   const { data: status, isError } = useQuery({
@@ -74,6 +88,23 @@ function WizardBody() {
     startTour();
   }, [complete, startTour]);
 
+  const onSelectProfile = useCallback(
+    (id: SetupProfileId) => {
+      if (!config) return;
+      // `=== true`, not truthy: an unresolved query must not silently turn
+      // meeting recording off when Full is picked.
+      patch(setupPatch(id, config, { whisperPresent: whisperPresent === true }));
+      setProfile(id);
+      applied.current = true;
+    },
+    [config, patch, whisperPresent],
+  );
+
+  const onRestartDaemon = useCallback(async () => {
+    await restartDaemon();
+    await qc.invalidateQueries({ queryKey: queryKeys.daemonStatus() });
+  }, [qc]);
+
   // Esc skips — matches the app's overlay convention (ConfirmDialog,
   // JournalSearchPanel). Enter advances only via the focused Next button's own
   // click (no global Enter binding) so a step is never double-advanced.
@@ -94,9 +125,18 @@ function WizardBody() {
       onSkip={complete}
     >
       {step === "welcome" && <WelcomeStep />}
+      {step === "setup" && <SetupStep selected={profile} onSelect={onSelectProfile} />}
       {step === "capture" && <CaptureStep verdict={verdict} onAction={(a) => void onAction(a)} busy={busy} />}
       {step === "privacy" && <PrivacyStep />}
-      {step === "finish" && <FinishStep verdict={verdict} onStartTour={onStartTour} />}
+      {step === "finish" && (
+        <FinishStep
+          verdict={verdict}
+          onStartTour={onStartTour}
+          profile={profile}
+          restartNeeded={applied.current}
+          onRestartDaemon={onRestartDaemon}
+        />
+      )}
     </WizardShell>
   );
 }

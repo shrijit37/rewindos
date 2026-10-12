@@ -714,6 +714,23 @@ impl Database {
         Ok(())
     }
 
+    /// Return screenshots stuck in `processing` to `pending`.
+    ///
+    /// A claim is only ever made by an in-memory worker, so at startup no
+    /// worker holds one: anything still marked `processing` was orphaned by a
+    /// crash, kill, or restart mid-OCR. Left alone it is permanently dead
+    /// row — the live pipeline only sees frames once, and the backfill queue
+    /// deliberately skips `processing` to avoid racing a live worker.
+    ///
+    /// Returns the number of rows reclaimed.
+    pub fn reset_stale_ocr_claims(&self) -> Result<usize> {
+        let reclaimed = self.conn.execute(
+            "UPDATE screenshots SET ocr_status = 'pending' WHERE ocr_status = 'processing'",
+            [],
+        )?;
+        Ok(reclaimed)
+    }
+
     /// Atomically replace every piece of OCR-derived state for a screenshot:
     /// FTS entry, text, bounding boxes, and the now-stale embedding, plus both
     /// status flags. One transaction, so a crash or an error mid-write leaves
@@ -4297,4 +4314,39 @@ mod tests {
             .unwrap();
         assert_eq!(vectors, 1, "re-embedding must replace, not duplicate");
     }
+
+    #[test]
+    fn startup_reclaims_ocr_interrupted_mid_request() {
+        let db = make_test_db();
+        let id = db.insert_screenshot(&make_screenshot(1000)).unwrap();
+        db.update_ocr_status(id, OcrStatus::Processing).unwrap();
+
+        // No live worker holds a claim at startup, so this row is orphaned.
+        assert_eq!(db.reset_stale_ocr_claims().unwrap(), 1);
+
+        let status: String = db
+            .conn()
+            .query_row(
+                "SELECT ocr_status FROM screenshots WHERE id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "pending");
+        // And it must be selectable again — otherwise it is a dead row.
+        let queue = db.get_screenshots_for_ocr_backfill(0, 10, false).unwrap();
+        assert_eq!(queue.len(), 1, "reclaimed row must re-enter the queue");
+    }
+
+    #[test]
+    fn startup_recovery_spares_rows_that_are_not_claimed() {
+        let db = make_test_db();
+        let done = db.insert_screenshot(&make_screenshot(1000)).unwrap();
+        db.update_ocr_status(done, OcrStatus::Done).unwrap();
+        let failed = db.insert_screenshot(&make_screenshot(2000)).unwrap();
+        db.update_ocr_status(failed, OcrStatus::Failed).unwrap();
+
+        assert_eq!(db.reset_stale_ocr_claims().unwrap(), 0);
+    }
+
 }

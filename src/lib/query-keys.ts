@@ -29,8 +29,10 @@ export const queryKeys = {
     ["chat-models", baseUrl, fingerprint(apiKey)] as const,
   ocrModels: (baseUrl: string, apiKey: string) =>
     ["ocr-models", baseUrl, fingerprint(apiKey)] as const,
+  ocrHealth: (engine: string) => ["ocr-health", engine] as const,
   semanticModels: (baseUrl: string, apiKey: string) =>
     ["semantic-models", baseUrl, fingerprint(apiKey)] as const,
+  semanticHealth: (provider: string) => ["semantic-health", provider] as const,
   hourlyBrowse: (startTime: number, endTime: number) =>
     ["hourly-browse", startTime, endTime] as const,
   rewind: (start: number, end: number) => ["rewind", start, end] as const,

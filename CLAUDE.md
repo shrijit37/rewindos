@@ -81,3 +81,19 @@ bun run tauri dev                # Run Tauri app in dev mode
 cargo run -p rewindos-daemon     # Run capture daemon directly
 cargo run -p rewindos-daemon -- backfill  # Backfill embeddings manually
 ```
+
+## Rust Build Efficiency Rules
+
+`.cargo/config.toml` pins `build.jobs = 2` — compiler parallelism is capped per
+invocation. Honor that when validating changes:
+
+- Do not run `cargo build` or `cargo test` after every individual file edit.
+- Batch related code changes before running validation.
+- Use `cargo fmt --check` for formatting validation.
+- Use `cargo check` for routine compile-error validation (no codegen, no linking).
+- Run targeted tests (`cargo test -p rewindos-core <name>`) after a logical change.
+- Run the full test suite and a final build at meaningful checkpoints.
+- Never run overlapping Cargo builds for this workspace — the job cap is per
+  invocation, so two concurrent builds double the CPU load.
+- Reuse existing Cargo caches. Never run `cargo clean` or prune caches to fix a
+  slow build; investigate repeated compilation first.

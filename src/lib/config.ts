@@ -83,4 +83,7 @@ export interface AppConfig {
     end_of_day_hour: number;
     create_daily_note_if_absent: boolean;
   };
+  setup: {
+    profile: "lean" | "balanced" | "full";
+  };
 }

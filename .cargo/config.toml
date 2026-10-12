@@ -1,0 +1,5 @@
+# Cap compiler parallelism so agent-driven build loops don't saturate all cores.
+# Cargo honors this per invocation -- overlapping builds each get their own limit,
+# so never run two cargo builds for this workspace concurrently.
+[build]
+jobs = 2

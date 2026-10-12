@@ -18,6 +18,7 @@ pub struct AppConfig {
     pub categories: CategoriesConfig,
     pub meeting: MeetingConfig,
     pub vault_export: VaultExportConfig,
+    pub setup: SetupConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,6 +185,23 @@ pub struct VaultExportConfig {
     /// Opt-in: create the user's daily note with the embed if it doesn't exist.
     /// Creates only; never overwrites an existing note.
     pub create_daily_note_if_absent: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SetupConfig {
+    /// Which setup type the onboarding wizard applied: "lean" | "balanced" | "full".
+    /// A label plus a starting point — Settings can still change any individual
+    /// toggle afterwards, so nothing branches on this at runtime.
+    pub profile: String,
+}
+
+impl Default for SetupConfig {
+    fn default() -> Self {
+        Self {
+            profile: "balanced".to_string(),
+        }
+    }
 }
 
 impl Default for MeetingConfig {
@@ -763,5 +781,37 @@ embedding_dimensions = 768
         assert!(!cfg.chat.enabled);
         // disable wins: model/provider must be left at their defaults, not mutated
         assert_eq!(cfg.chat.model, default_model);
+    }
+
+    #[test]
+    fn setup_profile_defaults_to_balanced() {
+        let c = AppConfig::default();
+        assert_eq!(c.setup.profile, "balanced");
+    }
+
+    #[test]
+    fn setup_profile_round_trips_and_old_configs_still_parse() {
+        let f = NamedTempFile::new().unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.setup.profile = "lean".to_string();
+        cfg.save_to(f.path()).unwrap();
+
+        let loaded = AppConfig::load_from(f.path()).unwrap();
+        assert_eq!(loaded.setup.profile, "lean");
+
+        // A config.toml written before [setup] existed (no table at all) must
+        // still parse and land on the balanced default.
+        let old = f.path().with_extension("old.toml");
+        let toml_str = fs::read_to_string(f.path()).unwrap();
+        let stripped: String = toml_str
+            .split("\n[setup]")
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        fs::write(&old, &stripped).unwrap();
+        assert!(!stripped.contains("[setup]"));
+
+        let legacy = AppConfig::load_from(&old).unwrap();
+        assert_eq!(legacy.setup.profile, "balanced");
     }
 }

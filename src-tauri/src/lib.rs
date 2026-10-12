@@ -962,6 +962,11 @@ async fn ask_claude(
     stored_text: Option<String>,
     on_event: tauri::ipc::Channel<ask_stream::AskStreamEvent>,
 ) -> Result<(), String> {
+    // Setup profile gate: Lean promises nothing local runs inference.
+    if !state.config.lock().map_err(|e| format!("config lock: {e}"))?.chat.enabled {
+        return Err("Ask is off in this setup — turn it on in Settings → AI".to_string());
+    }
+
     use rewindos_core::chat_store;
     use rewindos_core::schema::{BlockKind, ChatRole};
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -1087,6 +1092,11 @@ async fn ask_agentic(
     prompt: String,
     on_event: tauri::ipc::Channel<ask_stream::AskStreamEvent>,
 ) -> Result<(), String> {
+    // Setup profile gate: Lean promises nothing local runs inference.
+    if !state.config.lock().map_err(|e| format!("config lock: {e}"))?.chat.enabled {
+        return Err("Ask is off in this setup — turn it on in Settings → AI".to_string());
+    }
+
     use rewindos_core::agentic::{execute_tool, tool_schemas};
     use rewindos_core::chat::{ChatClient, ToolTurn};
 
@@ -1807,6 +1817,21 @@ enum ChatStreamEvent {
     Error { message: String },
 }
 
+/// Restart the user service so it re-reads config.toml. Setup profiles apply
+/// OCR/semantic/chat/meeting at daemon startup, not live.
+#[tauri::command]
+fn restart_daemon() -> Result<(), String> {
+    let status = std::process::Command::new("systemctl")
+        .args(["--user", "restart", "rewindos-daemon"])
+        .status()
+        .map_err(|e| format!("restart daemon: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("systemctl exited with {status}"))
+    }
+}
+
 #[tauri::command]
 async fn chat_stream_completion(
     state: State<'_, AppState>,
@@ -1815,6 +1840,11 @@ async fn chat_stream_completion(
     messages: Vec<rewindos_core::chat::ChatMessage>,
     on_event: tauri::ipc::Channel<ChatStreamEvent>,
 ) -> Result<(), String> {
+    // Setup profile gate: Lean promises nothing local runs inference.
+    if !state.config.lock().map_err(|e| format!("config lock: {e}"))?.chat.enabled {
+        return Err("Ask is off in this setup — turn it on in Settings → AI".to_string());
+    }
+
     let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
         let mut map = state.chat_cancel_flags.lock().await;
@@ -2407,6 +2437,7 @@ pub fn run() {
             ocr_health_check,
             ocr_list_models,
             semantic_health_check,
+            restart_daemon,
             semantic_list_models,
             toggle_bookmark,
             is_bookmarked,

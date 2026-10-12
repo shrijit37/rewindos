@@ -728,6 +728,12 @@ export async function updateConfig(
   return invoke("update_config", { configJson: config });
 }
 
+/** Restart the capture daemon so it re-reads config.toml (OCR, semantic,
+ * chat and meeting toggles are read at startup, not live). */
+export async function restartDaemon(): Promise<void> {
+  return invoke("restart_daemon");
+}
+
 export async function chatHealthCheck(chat: AppConfig["chat"]): Promise<boolean> {
   return invoke("chat_health_check", { chat });
 }

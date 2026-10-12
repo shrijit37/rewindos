@@ -694,8 +694,9 @@ async fn run_daemon() -> anyhow::Result<()> {
     info!(path = %db_path.display(), "database opened");
     let db = Arc::new(Mutex::new(db));
 
-    // Embedding backend probe. Ollama path: always probe regardless of
-    // config.semantic.enabled (auto-detect + pull). API/gateway paths: never
+    // Embedding backend probe. Ollama path: probed and pulled ONLY when
+    // config.semantic.enabled — a Lean setup must not load or download a local
+    // model on a machine that happens to run Ollama. API/gateway paths: never
     // contact ollama_url and never pull — just health-check the endpoint.
     let ollama_client: Option<Arc<EmbeddingClient>> = if config.semantic.provider == "api"
         || config.semantic.provider == "gateway"
@@ -720,6 +721,9 @@ async fn run_daemon() -> anyhow::Result<()> {
                 None
             }
         }
+    } else if !config.semantic.enabled {
+        info!("semantic search disabled — skipping the local embedding backend probe");
+        None
     } else {
         let client = OllamaClient::new(&config.semantic.ollama_url, &config.semantic.model);
         if client.health_check().await {
@@ -990,6 +994,25 @@ async fn run_daemon() -> anyhow::Result<()> {
                 tracing::warn!(recovered = n, "closed meetings left open by a previous run")
             }
             Ok(Err(e)) => tracing::warn!(error = %e, "meeting crash-recovery failed"),
+            _ => {}
+        }
+    }
+
+    // Crash recovery: a screenshot claimed for OCR by a worker that never
+    // finished (kill, panic, restart mid-request) stays 'processing' forever.
+    // No live worker holds a claim at startup, so reclaim them all.
+    {
+        let db = db.clone();
+        let reclaimed = tokio::task::spawn_blocking(move || {
+            let db = db.lock().unwrap_or_else(|e| e.into_inner());
+            db.reset_stale_ocr_claims()
+        })
+        .await;
+        match reclaimed {
+            Ok(Ok(n)) if n > 0 => {
+                tracing::warn!(reclaimed = n, "returned interrupted OCR claims to pending")
+            }
+            Ok(Err(e)) => tracing::warn!(error = %e, "OCR claim recovery failed"),
             _ => {}
         }
     }

@@ -310,6 +310,21 @@ impl DaemonService {
         title: &str,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<i64> {
+        // Reload from disk: the UI edits config.toml without notifying the
+        // daemon, so the startup value can be stale. Same pattern as
+        // check_export_ready.
+        let meeting_enabled = match AppConfig::load() {
+            Ok(c) => c.meeting.enabled,
+            Err(e) => {
+                warn!("config reload failed, using startup config: {e:#}");
+                self.config.meeting.enabled
+            }
+        };
+        if !meeting_enabled {
+            return Err(zbus::fdo::Error::Failed(
+                "meeting recording is off in this setup — turn it on in Settings → Meetings".into(),
+            ));
+        }
         let title = if title.is_empty() {
             None
         } else {
