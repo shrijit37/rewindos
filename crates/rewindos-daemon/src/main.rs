@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use clap::{Parser, Subcommand};
 use rewindos_core::config::{init_logging, AppConfig};
 use rewindos_core::db::Database;
-use rewindos_core::embedding::OllamaClient;
+use rewindos_core::embedding::{EmbeddingClient, OllamaClient};
 use rewindos_core::hasher;
 use rewindos_core::ocr;
 use rewindos_core::paddle_ocr;
@@ -187,9 +187,13 @@ async fn run_backfill(batch_size: usize) -> anyhow::Result<()> {
     let db_path = config.db_path()?;
     let db = Database::open(&db_path)?;
 
-    let client = OllamaClient::new(&config.semantic.ollama_url, &config.semantic.model);
+    let client = EmbeddingClient::from_config(&config.semantic)
+        .map_err(|e| anyhow::anyhow!("invalid semantic config: {e}"))?;
 
     if !client.health_check().await {
+        if client.is_api() {
+            anyhow::bail!("embedding API is not reachable. Check api_base_url and api_key.");
+        }
         anyhow::bail!(
             "Ollama is not reachable at {}. Start Ollama and ensure '{}' model is pulled.",
             config.semantic.ollama_url,
@@ -197,7 +201,7 @@ async fn run_backfill(batch_size: usize) -> anyhow::Result<()> {
         );
     }
 
-    println!("Connected to Ollama, starting backfill...");
+    println!("Connected ({}), starting backfill...", client.model());
 
     let mut total_processed = 0u64;
 
@@ -216,12 +220,12 @@ async fn run_backfill(batch_size: usize) -> anyhow::Result<()> {
                 i + 1,
             );
 
-            match client.embed(&text).await {
+            match client.embed(&text, config.semantic.embedding_dimensions).await {
                 Ok(Some(embedding)) => {
                     db.insert_embedding(screenshot_id, &embedding)?;
                 }
                 Ok(None) => {
-                    eprintln!("\nOllama became unavailable, stopping.");
+                    eprintln!("\nEmbedding backend became unavailable, stopping.");
                     return Ok(());
                 }
                 Err(e) => {
@@ -242,36 +246,56 @@ async fn run_backfill_ocr(batch_size: usize) -> anyhow::Result<()> {
     let db_path = config.db_path()?;
     let db = Arc::new(Mutex::new(Database::open(&db_path)?));
 
-    // Find the PaddleOCR worker script
-    let script_path = paddle_ocr::find_worker_script()
-        .ok_or_else(|| anyhow::anyhow!(
-            "paddleocr_worker.py not found. Expected in ~/.rewindos/, /usr/lib/rewindos/, or scripts/"
-        ))?;
-
-    // Check that PaddleOCR is importable
-    if !paddle_ocr::is_paddleocr_available(&config.ocr.python_bin).await {
-        anyhow::bail!(
-            "PaddleOCR not available. Install with: pip install paddleocr paddlepaddle"
-        );
-    }
+    // API mode calls the vision endpoint instead of touching sidecars.
+    let engine = ocr::OcrEngine::from_config(&config.ocr.engine);
+    let api_client: Option<Arc<ocr::ApiOcrClient>> = if engine == ocr::OcrEngine::Api {
+        match ocr::ApiOcrClient::from_config(&config.ocr) {
+            Ok(c) => {
+                println!("API OCR configured (model {}), starting backfill...", config.ocr.api_model);
+                Some(Arc::new(c))
+            }
+            Err(e) => anyhow::bail!("invalid API OCR config: {e}"),
+        }
+    } else {
+        None
+    };
 
     let max_workers = (config.ocr.max_workers as usize).max(1);
-    println!(
-        "PaddleOCR available, worker script: {} (workers: {max_workers})",
-        script_path.display()
-    );
 
-    // Spawn N sidecar workers for true parallelism (each is its own Python process)
-    let sidecars: Vec<Arc<paddle_ocr::PaddleOcrSidecar>> = (0..max_workers)
-        .map(|_| {
-            Arc::new(paddle_ocr::PaddleOcrSidecar::new(
-                &config.ocr.python_bin,
-                &script_path,
-                &config.ocr.tesseract_lang,
-                config.ocr.idle_timeout_secs,
-            ))
-        })
-        .collect();
+    // Spawn N sidecar workers for true parallelism (each is its own Python
+    // process). Skipped entirely in API mode.
+    let sidecars: Vec<Arc<paddle_ocr::PaddleOcrSidecar>> = if api_client.is_none() {
+        // Find the PaddleOCR worker script
+        let script_path = paddle_ocr::find_worker_script()
+            .ok_or_else(|| anyhow::anyhow!(
+                "paddleocr_worker.py not found. Expected in ~/.rewindos/, /usr/lib/rewindos/, or scripts/"
+            ))?;
+
+        // Check that PaddleOCR is importable
+        if !paddle_ocr::is_paddleocr_available(&config.ocr.python_bin).await {
+            anyhow::bail!(
+                "PaddleOCR not available. Install with: pip install paddleocr paddlepaddle"
+            );
+        }
+
+        println!(
+            "PaddleOCR available, worker script: {} (workers: {max_workers})",
+            script_path.display()
+        );
+
+        (0..max_workers)
+            .map(|_| {
+                Arc::new(paddle_ocr::PaddleOcrSidecar::new(
+                    &config.ocr.python_bin,
+                    &script_path,
+                    &config.ocr.tesseract_lang,
+                    config.ocr.idle_timeout_secs,
+                ))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_workers));
     let total_processed = Arc::new(AtomicU64::new(0));
@@ -300,7 +324,9 @@ async fn run_backfill_ocr(batch_size: usize) -> anyhow::Result<()> {
 
             let permit = semaphore.clone().acquire_owned().await.unwrap();
             let idx = worker_idx.fetch_add(1, Ordering::Relaxed) as usize % max_workers;
-            let sidecar = sidecars[idx].clone();
+            let api = api_client.clone();
+            let sidecar = if api.is_none() { Some(sidecars[idx].clone()) } else { None };
+            let label = if api_client.is_some() { "API OCR" } else { "PaddleOCR" };
             let db = db.clone();
             let total_processed = total_processed.clone();
             let total_errors = total_errors.clone();
@@ -325,8 +351,13 @@ async fn run_backfill_ocr(batch_size: usize) -> anyhow::Result<()> {
                     }
                 }
 
-                // Re-run OCR with PaddleOCR
-                match sidecar.run_ocr(std::path::Path::new(&file_path)).await {
+                // Re-run OCR (vision API in API mode, PaddleOCR sidecar otherwise)
+                let ocr_result = match (api, sidecar) {
+                    (Some(api), _) => api.run_api_ocr(std::path::Path::new(&file_path)).await,
+                    (None, Some(sidecar)) => sidecar.run_ocr(std::path::Path::new(&file_path)).await,
+                    (None, None) => unreachable!("local OCR path always builds a sidecar"),
+                };
+                match ocr_result {
                     Ok(output) => {
                         consecutive_errors.store(0, Ordering::Relaxed);
                         let db = db.lock().unwrap();
@@ -344,12 +375,12 @@ async fn run_backfill_ocr(batch_size: usize) -> anyhow::Result<()> {
                         db.update_ocr_status(screenshot_id, OcrStatus::Done).ok();
                     }
                     Err(e) => {
-                        eprintln!("\nPaddleOCR failed for #{screenshot_id}: {e}");
+                        eprintln!("\n{label} failed for #{screenshot_id}: {e}");
                         total_errors.fetch_add(1, Ordering::Relaxed);
                         let errs = consecutive_errors.fetch_add(1, Ordering::Relaxed) + 1;
                         db.lock().unwrap().update_ocr_status(screenshot_id, OcrStatus::Failed).ok();
                         if errs >= 3 {
-                            eprintln!("3 consecutive failures — aborting. Fix the PaddleOCR worker and retry.");
+                            eprintln!("3 consecutive failures — aborting. Fix the {label} setup and retry.");
                             abort_flag.store(true, Ordering::Relaxed);
                         }
                     }
@@ -604,8 +635,9 @@ async fn run_daemon() -> anyhow::Result<()> {
         "rewindos-daemon starting"
     );
 
-    // Check tesseract availability
-    if config.ocr.enabled && !ocr::is_tesseract_available().await {
+    // Check tesseract availability (API mode never spawns local binaries)
+    let ocr_engine = ocr::OcrEngine::from_config(&config.ocr.engine);
+    if config.ocr.enabled && ocr_engine != ocr::OcrEngine::Api && !ocr::is_tesseract_available().await {
         warn!("tesseract not found — OCR will be disabled");
     }
 
@@ -618,8 +650,25 @@ async fn run_daemon() -> anyhow::Result<()> {
     info!(path = %db_path.display(), "database opened");
     let db = Arc::new(Mutex::new(db));
 
-    // Auto-detect Ollama: always probe regardless of config.semantic.enabled
-    let ollama_client = {
+    // Embedding backend probe. Ollama path: always probe regardless of
+    // config.semantic.enabled (auto-detect + pull). API path: never contact
+    // ollama_url and never pull — just health-check the configured endpoint.
+    let ollama_client: Option<Arc<EmbeddingClient>> = if config.semantic.provider == "api" {
+        match EmbeddingClient::from_config(&config.semantic) {
+            Ok(client) if client.health_check().await => {
+                info!(model = %client.model(), "embedding API reachable — semantic search enabled");
+                Some(Arc::new(client))
+            }
+            Ok(_) => {
+                info!("embedding API not reachable — using keyword-only search");
+                None
+            }
+            Err(e) => {
+                warn!(error = %e, "invalid semantic API config — using keyword-only search");
+                None
+            }
+        }
+    } else {
         let client = OllamaClient::new(&config.semantic.ollama_url, &config.semantic.model);
         if client.health_check().await {
             let model = config.semantic.model.clone();
@@ -634,7 +683,7 @@ async fn run_daemon() -> anyhow::Result<()> {
                 }
             }
             info!(url = %config.semantic.ollama_url, "Ollama detected — semantic search enabled");
-            Some(Arc::new(client))
+            Some(Arc::new(EmbeddingClient::Ollama(client)))
         } else {
             info!(
                 "Ollama not reachable at {} — using keyword-only search",
@@ -789,10 +838,13 @@ async fn run_daemon() -> anyhow::Result<()> {
             Err(e) => return Err(e.into()),
         };
 
-    // Spawn background embedding backfill if Ollama is available
-    if let Some(ref client) = ollama_client {
+    // Spawn background embedding backfill when a semantic backend is available
+    if let Some(client) = &ollama_client {
         let backfill_db = db.clone();
         let backfill_client = client.clone();
+        // Hoisted: the task below is `move`, and `config` is still needed
+        // afterwards (D-Bus service, schedulers) — don't move the Arc in.
+        let backfill_dims = config.semantic.embedding_dimensions;
         tokio::spawn(async move {
             info!("starting background embedding backfill");
             let mut total = 0u64;
@@ -816,7 +868,7 @@ async fn run_daemon() -> anyhow::Result<()> {
                 }
 
                 for (screenshot_id, text) in pending {
-                    match backfill_client.embed(&text).await {
+                    match backfill_client.embed(&text, backfill_dims).await {
                         Ok(Some(embedding)) => {
                             let db = backfill_db.lock().unwrap_or_else(|e| e.into_inner());
                             if let Err(e) = db.insert_embedding(screenshot_id, &embedding) {
@@ -827,7 +879,7 @@ async fn run_daemon() -> anyhow::Result<()> {
                             }
                         }
                         Ok(None) => {
-                            warn!("backfill: Ollama became unavailable, stopping");
+                            warn!("backfill: embedding backend became unavailable, stopping");
                             return;
                         }
                         Err(e) => {

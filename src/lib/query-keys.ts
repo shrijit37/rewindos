@@ -27,6 +27,10 @@ export const queryKeys = {
   claudeStatus: () => ["claude-status"] as const,
   chatModels: (baseUrl: string, apiKey: string) =>
     ["chat-models", baseUrl, fingerprint(apiKey)] as const,
+  ocrModels: (baseUrl: string, apiKey: string) =>
+    ["ocr-models", baseUrl, fingerprint(apiKey)] as const,
+  semanticModels: (baseUrl: string, apiKey: string) =>
+    ["semantic-models", baseUrl, fingerprint(apiKey)] as const,
   hourlyBrowse: (startTime: number, endTime: number) =>
     ["hourly-browse", startTime, endTime] as const,
   rewind: (start: number, end: number) => ["rewind", start, end] as const,

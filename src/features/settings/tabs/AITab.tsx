@@ -14,7 +14,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { claudeDetect, claudeRegisterMcp, chatHealthCheck, chatListModels } from "@/lib/api";
+import { claudeDetect, claudeRegisterMcp, chatHealthCheck, chatListModels, semanticHealthCheck, semanticListModels } from "@/lib/api";
 import { queryKeys } from "@/lib/query-keys";
 
 function useDebounced<T>(value: T, ms: number): T {
@@ -69,6 +69,33 @@ export function AITab({ config, update }: TabProps) {
     const p = PROVIDER_PRESETS.find((x) => x.id === id);
     if (p?.baseUrl) update("chat", "base_url", p.baseUrl);
     setTestResult(null);
+  };
+
+  const [semanticTestResult, setSemanticTestResult] = useState<string | null>(null);
+
+  const debouncedSemanticBaseUrl = useDebounced(config.semantic.api_base_url, 500);
+  const debouncedSemanticApiKey = useDebounced(config.semantic.api_key, 500);
+
+  const semanticTest = useMutation({
+    mutationFn: () => semanticHealthCheck(config.semantic),
+    onSuccess: (ok) => setSemanticTestResult(ok ? "connected" : "unreachable"),
+    onError: (e) => setSemanticTestResult(String(e)),
+  });
+
+  const { data: semanticModels } = useQuery({
+    queryKey: queryKeys.semanticModels(debouncedSemanticBaseUrl, debouncedSemanticApiKey),
+    queryFn: () => semanticListModels({ ...config.semantic, api_base_url: debouncedSemanticBaseUrl, api_key: debouncedSemanticApiKey }),
+    enabled: config.semantic.enabled && config.semantic.provider === "api" && !!debouncedSemanticBaseUrl,
+    retry: false,
+    staleTime: 30_000,
+  });
+
+  const onSemanticProviderChange = (id: string) => {
+    update("semantic", "provider", id as AppConfig["semantic"]["provider"]);
+    if (id === "api" && !config.semantic.api_base_url) {
+      update("semantic", "api_base_url", "https://api.openai.com/v1");
+    }
+    setSemanticTestResult(null);
   };
 
   return (
@@ -181,12 +208,92 @@ export function AITab({ config, update }: TabProps) {
           onChange={(v) => update("semantic", "enabled", v)}
         />
       </Field>
-      <Field label="Embedding Model">
-        <TextInput
-          value={config.semantic.model}
-          onChange={(v) => update("semantic", "model", v)}
-        />
+      <Field label="Provider">
+        <Select value={config.semantic.provider} onValueChange={onSemanticProviderChange}>
+          <SelectTrigger className="font-mono">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="ollama" className="font-mono">Ollama</SelectItem>
+            <SelectItem value="api" className="font-mono">OpenAI-compatible API</SelectItem>
+          </SelectContent>
+        </Select>
       </Field>
+      {config.semantic.provider === "ollama" && (
+        <Field label="Embedding Model">
+          <TextInput
+            value={config.semantic.model}
+            onChange={(v) => update("semantic", "model", v)}
+          />
+        </Field>
+      )}
+      {config.semantic.provider === "api" && (
+        <>
+          <Field
+            label="Base URL"
+            hint="Any OpenAI-compatible embeddings endpoint. Takes effect after a daemon restart."
+          >
+            <TextInput
+              value={config.semantic.api_base_url}
+              onChange={(v) => { update("semantic", "api_base_url", v); setSemanticTestResult(null); }}
+            />
+          </Field>
+          <Field label="API Key">
+            <TextInput
+              type="password"
+              value={config.semantic.api_key}
+              onChange={(v) => { update("semantic", "api_key", v); setSemanticTestResult(null); }}
+              autoComplete="off"
+            />
+          </Field>
+          <Field label="Model">
+            <>
+              <TextInput
+                value={config.semantic.api_model}
+                onChange={(v) => update("semantic", "api_model", v)}
+                list="semantic-model-options"
+              />
+              <datalist id="semantic-model-options">
+                {(semanticModels ?? []).map((m) => (
+                  <option key={m} value={m} />
+                ))}
+              </datalist>
+            </>
+          </Field>
+          <Field
+            label="Dimensions"
+            hint="0 = auto (accept whatever the API returns). Must match the model otherwise."
+          >
+            <NumberInput
+              value={config.semantic.embedding_dimensions}
+              min={0}
+              max={4096}
+              onChange={(v) => update("semantic", "embedding_dimensions", v)}
+            />
+          </Field>
+          <Field label="">
+            <div className="flex items-center gap-3">
+              <Button
+                variant="editorial"
+                size="editorial"
+                onClick={() => semanticTest.mutate()}
+                disabled={semanticTest.isPending}
+              >
+                {semanticTest.isPending ? "testing..." : "Test connection"}
+              </Button>
+              {semanticTestResult && (
+                <span
+                  className={`font-mono text-[11px] ${
+                    semanticTestResult === "connected" ? "text-signal-active" : "text-text-muted"
+                  }`}
+                >
+                  {semanticTestResult}
+                </span>
+              )}
+            </div>
+          </Field>
+        </>
+      )}
     </>
   );
 }

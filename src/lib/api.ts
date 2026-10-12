@@ -736,6 +736,26 @@ export async function chatListModels(chat: AppConfig["chat"]): Promise<string[]>
   return invoke("chat_list_models", { chat });
 }
 
+export async function ocrHealthCheck(ocr: AppConfig["ocr"]): Promise<boolean> {
+  return invoke("ocr_health_check", { ocr });
+}
+
+export async function ocrListModels(ocr: AppConfig["ocr"]): Promise<string[]> {
+  return invoke("ocr_list_models", { ocr });
+}
+
+export async function semanticHealthCheck(
+  semantic: AppConfig["semantic"],
+): Promise<boolean> {
+  return invoke("semantic_health_check", { semantic });
+}
+
+export async function semanticListModels(
+  semantic: AppConfig["semantic"],
+): Promise<string[]> {
+  return invoke("semantic_list_models", { semantic });
+}
+
 // -- Claude Code integration --
 
 export interface ClaudeCodeStatus {

@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use rewindos_core::config::AppConfig;
 use rewindos_core::db::Database;
-use rewindos_core::embedding::OllamaClient as EmbeddingClient;
+use rewindos_core::embedding::EmbeddingClient;
 use rewindos_core::schema::{
     ActiveBlock, ActivityResponse, Bookmark, BoundingBox, CachedDailySummary, Collection,
     JournalDateInfo, JournalEntry, JournalScreenshot, JournalSearchResponse, JournalStreakInfo,
@@ -1883,6 +1883,54 @@ async fn chat_list_models(chat: rewindos_core::config::ChatConfig) -> Result<Vec
 }
 
 #[tauri::command]
+async fn ocr_health_check(ocr: rewindos_core::config::OcrConfig) -> Result<bool, String> {
+    match rewindos_core::ocr::OcrEngine::from_config(&ocr.engine) {
+        rewindos_core::ocr::OcrEngine::Api => {
+            match rewindos_core::ocr::ApiOcrClient::from_config(&ocr) {
+                Ok(client) => Ok(client.health_check().await),
+                Err(e) => Err(e.to_string()),
+            }
+        }
+        rewindos_core::ocr::OcrEngine::Tesseract => {
+            Ok(rewindos_core::ocr::is_tesseract_available().await)
+        }
+        rewindos_core::ocr::OcrEngine::PaddleOcr => {
+            Ok(rewindos_core::paddle_ocr::is_paddleocr_available(&ocr.python_bin).await)
+        }
+    }
+}
+
+#[tauri::command]
+async fn ocr_list_models(ocr: rewindos_core::config::OcrConfig) -> Result<Vec<String>, String> {
+    if rewindos_core::ocr::OcrEngine::from_config(&ocr.engine)
+        != rewindos_core::ocr::OcrEngine::Api
+    {
+        return Ok(vec![]);
+    }
+    let client =
+        rewindos_core::ocr::ApiOcrClient::from_config(&ocr).map_err(|e| e.to_string())?;
+    client.list_models().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn semantic_health_check(
+    semantic: rewindos_core::config::SemanticConfig,
+) -> Result<bool, String> {
+    let client = rewindos_core::embedding::EmbeddingClient::from_config(&semantic)
+        .map_err(|e| e.to_string())?;
+    Ok(client.health_check().await)
+}
+
+#[tauri::command]
+async fn semantic_list_models(
+    semantic: rewindos_core::config::SemanticConfig,
+) -> Result<Vec<String>, String> {
+    let client = rewindos_core::embedding::EmbeddingClient::from_config(&semantic)
+        .map_err(|e| e.to_string())?;
+    client.list_models().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn get_config(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let cfg = state
         .config
@@ -2020,10 +2068,13 @@ pub fn run() {
                 Database::open(&db_path).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
 
             let embedding_client = if config.semantic.enabled {
-                Some(EmbeddingClient::new(
-                    &config.semantic.ollama_url,
-                    &config.semantic.model,
-                ))
+                match EmbeddingClient::from_config(&config.semantic) {
+                    Ok(client) => Some(client),
+                    Err(e) => {
+                        warn!("invalid semantic config, semantic search disabled: {e}");
+                        None
+                    }
+                }
             } else {
                 None
             };
@@ -2345,6 +2396,10 @@ pub fn run() {
             chat_stream_cancel,
             chat_health_check,
             chat_list_models,
+            ocr_health_check,
+            ocr_list_models,
+            semantic_health_check,
+            semantic_list_models,
             toggle_bookmark,
             is_bookmarked,
             get_bookmarked_ids,

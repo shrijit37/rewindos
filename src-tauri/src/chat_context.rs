@@ -4,7 +4,7 @@ use rewindos_core::chat::{
 };
 use rewindos_core::config::AppConfig;
 use rewindos_core::db::Database;
-use rewindos_core::embedding::OllamaClient as EmbeddingClient;
+use rewindos_core::embedding::EmbeddingClient;
 use rewindos_core::schema::SearchFilters;
 use serde::Serialize;
 
@@ -40,7 +40,7 @@ pub async fn build(
     };
     // One embedding shared by screenshot and transcript retrieval.
     let query_embedding = match embedding_client {
-        Some(c) => c.embed(&search_query).await.ok().flatten(),
+        Some(c) => c.embed(&search_query, config.semantic.embedding_dimensions).await.ok().flatten(),
         None => None,
     };
 

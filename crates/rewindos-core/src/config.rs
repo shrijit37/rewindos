@@ -60,7 +60,7 @@ pub struct PrivacyConfig {
 #[serde(default)]
 pub struct OcrConfig {
     pub enabled: bool,
-    /// OCR engine to use: "tesseract" or "paddleocr"
+    /// OCR engine to use: "tesseract", "paddleocr", or "api"
     pub engine: String,
     pub tesseract_lang: String,
     pub max_workers: u32,
@@ -70,6 +70,17 @@ pub struct OcrConfig {
     pub python_bin: String,
     /// Kill PaddleOCR worker after this many seconds of inactivity (default: 60)
     pub idle_timeout_secs: u64,
+    /// OpenAI-compatible vision endpoint base URL, e.g. "https://api.openai.com/v1".
+    /// Only used when `engine == "api"`; ignored otherwise.
+    pub api_base_url: String,
+    /// Bearer token; empty = no Authorization header (self-hosted gateways).
+    pub api_key: String,
+    /// Vision-capable chat model, e.g. "gpt-4o-mini".
+    pub api_model: String,
+    /// Per-request HTTP timeout for API OCR.
+    pub api_timeout_secs: u64,
+    /// Screenshots wider than this are downscaled before upload.
+    pub api_max_width: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +97,15 @@ pub struct SemanticConfig {
     pub ollama_url: String,
     pub model: String,
     pub embedding_dimensions: usize,
+    /// Embedding backend: "ollama" or "api". When "ollama", all `api_*`
+    /// fields are ignored and behavior is byte-identical to before.
+    pub provider: String,
+    /// OpenAI-compatible embeddings endpoint base URL, e.g. "https://api.openai.com/v1".
+    pub api_base_url: String,
+    /// Bearer token; empty = no Authorization header.
+    pub api_key: String,
+    /// Embedding model, e.g. "text-embedding-3-small".
+    pub api_model: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -255,6 +275,11 @@ impl Default for OcrConfig {
             model_dir: "~/.rewindos/models/paddleocr".to_string(),
             python_bin: "python3".to_string(),
             idle_timeout_secs: 60,
+            api_base_url: String::new(),
+            api_key: String::new(),
+            api_model: String::new(),
+            api_timeout_secs: 30,
+            api_max_width: 1600,
         }
     }
 }
@@ -275,6 +300,10 @@ impl Default for SemanticConfig {
             ollama_url: "http://localhost:11434".to_string(),
             model: "nomic-embed-text".to_string(),
             embedding_dimensions: 768,
+            provider: "ollama".to_string(),
+            api_base_url: String::new(),
+            api_key: String::new(),
+            api_model: String::new(),
         }
     }
 }
@@ -661,12 +690,67 @@ model = "llama3"
         let f = NamedTempFile::new().unwrap();
         let mut cfg = AppConfig::default();
         cfg.apply_ai_settings(Some("llama3.2:3b"), false, true);
+        cfg.ocr.engine = "api".to_string();
+        cfg.ocr.api_base_url = "https://api.openai.com/v1".to_string();
+        cfg.ocr.api_key = "sk-test".to_string();
+        cfg.ocr.api_model = "gpt-4o-mini".to_string();
+        cfg.ocr.api_timeout_secs = 45;
+        cfg.ocr.api_max_width = 1280;
+        cfg.semantic.provider = "api".to_string();
+        cfg.semantic.api_base_url = "https://api.openai.com/v1".to_string();
+        cfg.semantic.api_key = "sk-test".to_string();
+        cfg.semantic.api_model = "text-embedding-3-small".to_string();
         cfg.save_to(f.path()).unwrap();
         let loaded = AppConfig::load_from(f.path()).unwrap();
         assert_eq!(loaded.chat.model, "llama3.2:3b");
         assert!(loaded.semantic.enabled);
         assert_eq!(loaded.chat.provider, "ollama");
         assert_eq!(loaded.chat.base_url, "http://localhost:11434/v1");
+        assert_eq!(loaded.ocr.engine, "api");
+        assert_eq!(loaded.ocr.api_base_url, "https://api.openai.com/v1");
+        assert_eq!(loaded.ocr.api_key, "sk-test");
+        assert_eq!(loaded.ocr.api_model, "gpt-4o-mini");
+        assert_eq!(loaded.ocr.api_timeout_secs, 45);
+        assert_eq!(loaded.ocr.api_max_width, 1280);
+        assert_eq!(loaded.semantic.provider, "api");
+        assert_eq!(loaded.semantic.api_base_url, "https://api.openai.com/v1");
+        assert_eq!(loaded.semantic.api_key, "sk-test");
+        assert_eq!(loaded.semantic.api_model, "text-embedding-3-small");
+    }
+
+    #[test]
+    fn pre_change_toml_loads_with_api_defaults() {
+        // Config written before api_* keys existed must parse unchanged,
+        // with the new fields at their defaults.
+        let toml_content = r#"
+[ocr]
+engine = "tesseract"
+tesseract_lang = "eng"
+max_workers = 2
+model_dir = "~/.rewindos/models/paddleocr"
+python_bin = "python3"
+idle_timeout_secs = 60
+
+[semantic]
+enabled = false
+ollama_url = "http://localhost:11434"
+model = "nomic-embed-text"
+embedding_dimensions = 768
+"#;
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_content.as_bytes()).unwrap();
+
+        let config = AppConfig::load_from(f.path()).unwrap();
+        assert_eq!(config.ocr.engine, "tesseract");
+        assert!(config.ocr.api_base_url.is_empty());
+        assert!(config.ocr.api_key.is_empty());
+        assert!(config.ocr.api_model.is_empty());
+        assert_eq!(config.ocr.api_timeout_secs, 30);
+        assert_eq!(config.ocr.api_max_width, 1600);
+        assert_eq!(config.semantic.provider, "ollama");
+        assert!(config.semantic.api_base_url.is_empty());
+        assert!(config.semantic.api_key.is_empty());
+        assert!(config.semantic.api_model.is_empty());
     }
 
     #[test]

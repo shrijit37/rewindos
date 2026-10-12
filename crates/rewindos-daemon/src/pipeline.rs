@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex};
 use rewindos_core::app_label::AppLabelResolver;
 use rewindos_core::config::AppConfig;
 use rewindos_core::db::Database;
-use rewindos_core::embedding::OllamaClient;
+use rewindos_core::embedding::EmbeddingClient;
 use rewindos_core::hasher::{self, PerceptualHasher};
-use rewindos_core::ocr::{self, OcrEngine};
+use rewindos_core::ocr::{self, ApiOcrClient, OcrEngine};
 use rewindos_core::paddle_ocr::{self, PaddleOcrSidecar};
 use rewindos_core::schema::{EmbedRequest, NewScreenshot, OcrStatus, ProcessedFrame, RawFrame};
 use tokio::sync::mpsc;
@@ -369,6 +369,25 @@ async fn run_ocr_stage(
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_workers));
     let engine = OcrEngine::from_config(&config.ocr.engine);
 
+    // API mode: build the vision client once. Local inference is never
+    // touched on this path — no worker script lookup, no sidecar spawn,
+    // no idle reaper. Invalid config warns here; each frame then fails
+    // with "client not configured" and is marked Failed (daemon stays up).
+    let api_client: Option<Arc<ApiOcrClient>> = if engine == OcrEngine::Api {
+        match ApiOcrClient::from_config(&config.ocr) {
+            Ok(client) => {
+                info!(base_url = %config.ocr.api_base_url, model = %config.ocr.api_model, "API OCR configured");
+                Some(Arc::new(client))
+            }
+            Err(e) => {
+                warn!(error = %e, "invalid API OCR config — screenshots will be marked Failed");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Create PaddleOCR sidecar handle if configured (lazy — no process spawned yet)
     let paddle_sidecar: Option<Arc<PaddleOcrSidecar>> = if engine == OcrEngine::PaddleOcr {
         match paddle_ocr::find_worker_script() {
@@ -432,6 +451,7 @@ async fn run_ocr_stage(
         let metrics = metrics.clone();
         let effective_engine = effective_engine.clone();
         let paddle_sidecar = paddle_sidecar.clone();
+        let api_client = api_client.clone();
 
         tokio::spawn(async move {
             let _permit = permit;
@@ -455,6 +475,7 @@ async fn run_ocr_stage(
                 &frame.file_path,
                 &lang,
                 paddle_sidecar.as_ref(),
+                api_client.as_deref(),
             )
             .await;
 
@@ -592,19 +613,34 @@ async fn run_embed_stage(
         return;
     }
 
-    let client = OllamaClient::new(&semantic_config.ollama_url, &semantic_config.model);
+    let client = match EmbeddingClient::from_config(semantic_config) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "invalid embedding config — embeddings will be skipped");
+            // Drain channel without processing
+            while embed_rx.recv().await.is_some() {}
+            info!("embed stage finished (no embedding backend)");
+            return;
+        }
+    };
 
     if !client.health_check().await {
-        warn!(
-            "Ollama is not reachable at {}, embeddings will be skipped",
-            semantic_config.ollama_url
-        );
+        if client.is_api() {
+            warn!("embedding API is not reachable, embeddings will be skipped");
+        } else {
+            warn!(
+                "Ollama is not reachable at {}, embeddings will be skipped",
+                semantic_config.ollama_url
+            );
+        }
+    } else if client.is_api() {
+        info!(model = %client.model(), "embed stage connected to embedding API");
     } else {
         info!("embed stage connected to Ollama");
     }
 
     while let Some(req) = embed_rx.recv().await {
-        match client.embed(&req.text).await {
+        match client.embed(&req.text, semantic_config.embedding_dimensions).await {
             Ok(Some(embedding)) => {
                 let db = db.clone();
                 let sid = req.screenshot_id;
@@ -632,7 +668,7 @@ async fn run_embed_stage(
             Ok(None) => {
                 debug!(
                     screenshot_id = req.screenshot_id,
-                    "Ollama unavailable, skipping embedding"
+                    "embedding backend unavailable, skipping embedding"
                 );
             }
             Err(e) => {

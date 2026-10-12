@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use rewindos_core::config::AppConfig;
 use rewindos_core::db::Database;
-use rewindos_core::embedding::OllamaClient;
+use rewindos_core::embedding::EmbeddingClient;
 use rewindos_core::schema::{
     CachedDailySummary, DaemonStatus, QueueDepths, SearchFilters, SearchResponse,
 };
@@ -36,7 +36,7 @@ pub struct DaemonService {
     pub capture_unsupported: bool,
     pub unfiltered_override: Arc<std::sync::atomic::AtomicBool>,
     pub start_time: Instant,
-    pub ollama_client: Option<Arc<OllamaClient>>,
+    pub ollama_client: Option<Arc<EmbeddingClient>>,
     pub kwin_window_info: Option<Arc<KwinWindowInfo>>,
     pub capture_backend_name: String,
     pub window_info: SharedProvider,
@@ -194,9 +194,9 @@ impl DaemonService {
         }
         filters.query = fts_query;
 
-        // Embed the query if Ollama is available
-        let query_embedding = if let Some(ref client) = self.ollama_client {
-            match client.embed(query).await {
+        // Embed the query when a semantic backend is configured (Ollama or API)
+        let query_embedding = if let Some(client) = &self.ollama_client {
+            match client.embed(query, self.config.semantic.embedding_dimensions).await {
                 Ok(emb) => emb,
                 Err(e) => {
                     warn!("failed to embed query: {e}");

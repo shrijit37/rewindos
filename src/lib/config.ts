@@ -9,19 +9,27 @@ export interface AppConfig {
     retention_days: number;
     screenshot_quality: number;
     thumbnail_width: number;
+    max_capture_width: number;
   };
   privacy: {
     excluded_apps: string[];
     excluded_title_patterns: string[];
+    capture_without_exclusion_enforcement: boolean;
+    usage_heartbeat: boolean;
   };
   ocr: {
     enabled: boolean;
-    engine: "tesseract" | "paddleocr";
+    engine: "tesseract" | "paddleocr" | "api";
     tesseract_lang: string;
     max_workers: number;
     model_dir: string;
     python_bin: string;
     idle_timeout_secs: number;
+    api_base_url: string;
+    api_key: string;
+    api_model: string;
+    api_timeout_secs: number;
+    api_max_width: number;
   };
   ui: {
     global_hotkey: string;
@@ -32,6 +40,10 @@ export interface AppConfig {
     ollama_url: string;
     model: string;
     embedding_dimensions: number;
+    provider: "ollama" | "api";
+    api_base_url: string;
+    api_key: string;
+    api_model: string;
   };
   chat: {
     enabled: boolean;

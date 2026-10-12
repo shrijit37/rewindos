@@ -8,7 +8,7 @@ use futures_util::{pin_mut, StreamExt};
 use rewindos_core::chat::{ChatClient, ChatMessage, ChatRole};
 use rewindos_core::config::AppConfig;
 use rewindos_core::db::Database;
-use rewindos_core::embedding::OllamaClient;
+use rewindos_core::embedding::EmbeddingClient;
 use rewindos_core::schema::TranscriptSegment;
 use tracing::{info, warn};
 
@@ -20,10 +20,16 @@ pub async fn run(db: Arc<Mutex<Database>>, config: Arc<AppConfig>, meeting_id: i
     }
 }
 
-/// Embed any `pending` transcript segments. Stops at the first sign Ollama is
-/// down (so we don't spin) — leftover segments stay `pending` for a later run.
+/// Embed any `pending` transcript segments. Stops at the first sign the
+/// embedding backend is down (so we don't spin) — leftover segments stay `pending` for a later run.
 async fn embed_pending_segments(db: &Arc<Mutex<Database>>, config: &AppConfig) {
-    let client = OllamaClient::new(&config.semantic.ollama_url, &config.semantic.model);
+    let client = match EmbeddingClient::from_config(&config.semantic) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "meeting: invalid embedding config, skipping transcript embeddings");
+            return;
+        }
+    };
     loop {
         let batch = {
             let db = db.lock().unwrap_or_else(|e| e.into_inner());
@@ -39,7 +45,7 @@ async fn embed_pending_segments(db: &Arc<Mutex<Database>>, config: &AppConfig) {
             return;
         }
         for (segment_id, text) in batch {
-            match client.embed(&text).await {
+            match client.embed(&text, config.semantic.embedding_dimensions).await {
                 Ok(Some(embedding)) => {
                     let db = db.lock().unwrap_or_else(|e| e.into_inner());
                     if let Err(e) = db.insert_transcript_embedding(segment_id, &embedding) {
@@ -47,7 +53,7 @@ async fn embed_pending_segments(db: &Arc<Mutex<Database>>, config: &AppConfig) {
                     }
                 }
                 Ok(None) => {
-                    info!("meeting: Ollama unavailable, deferring transcript embeddings");
+                    info!("meeting: embedding backend unavailable, deferring transcript embeddings");
                     return;
                 }
                 Err(e) => {
