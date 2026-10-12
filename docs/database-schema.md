@@ -323,14 +323,34 @@ WHERE id IN (?, ?, ?, ...);
 
 ### Pending embeddings (for backfill)
 
+`?1` is an id cursor. Failed rows stay `pending`, so a backfill that re-queries from
+the start would retry the same bad row forever; advancing the cursor is what lets
+both the CLI and the daemon's background pass terminate.
+
 ```sql
 SELECT s.id, otc.text_content
 FROM screenshots s
 JOIN ocr_text_content otc ON otc.screenshot_id = s.id
 WHERE s.ocr_status = 'done'
   AND s.embedding_status = 'pending'
+  AND s.id > ?1
 ORDER BY s.id
-LIMIT ?1;
+LIMIT ?2;
+```
+
+### OCR backfill queue
+
+`?3` selects `--missing-only` mode. `ocr_status='processing'` is excluded so backfill
+and the live pipeline never target the same row.
+
+```sql
+SELECT id, file_path
+FROM screenshots
+WHERE ocr_status IN ('pending', 'done', 'failed')
+  AND id > ?1
+  AND (?3 = 0 OR id NOT IN (SELECT screenshot_id FROM ocr_text_content))
+ORDER BY id
+LIMIT ?2;
 ```
 
 ### Deduplication check (capture-time)

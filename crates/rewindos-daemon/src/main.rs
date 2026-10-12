@@ -239,7 +239,11 @@ async fn run_backfill(batch_size: usize) -> anyhow::Result<()> {
 
             match client.embed(&text, config.semantic.embedding_dimensions).await {
                 Ok(Some(embedding)) => {
-                    db.insert_embedding(screenshot_id, &embedding)?;
+                    // A store failure is per-row too: propagating it would
+                    // abandon every remaining screenshot in the queue.
+                    if let Err(e) = db.insert_embedding(screenshot_id, &embedding) {
+                        eprintln!("\nFailed to store embedding for #{screenshot_id}: {e}");
+                    }
                 }
                 Ok(None) => {
                     eprintln!("\nEmbedding backend became unavailable, stopping.");
