@@ -66,6 +66,7 @@ struct ScreenshotDetail {
     width: i32,
     height: i32,
     ocr_text: Option<String>,
+    ocr_status: rewindos_core::schema::OcrStatus,
     bounding_boxes: Vec<BoundingBox>,
 }
 
@@ -343,6 +344,7 @@ fn get_screenshot(state: State<'_, AppState>, id: i64) -> Result<ScreenshotDetai
         width: screenshot.width,
         height: screenshot.height,
         ocr_text,
+        ocr_status: screenshot.ocr_status,
         bounding_boxes,
     })
 }

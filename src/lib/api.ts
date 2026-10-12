@@ -28,6 +28,8 @@ export interface SearchResponse {
   search_mode?: string;
 }
 
+export type OcrStatus = 'pending' | 'processing' | 'done' | 'failed';
+
 export interface ScreenshotDetail {
   id: number;
   timestamp: number;
@@ -38,6 +40,7 @@ export interface ScreenshotDetail {
   width: number;
   height: number;
   ocr_text: string | null;
+  ocr_status: OcrStatus;
   bounding_boxes: BoundingBox[];
 }
 
@@ -94,7 +97,7 @@ export interface Screenshot {
   height: number;
   file_size_bytes: number;
   perceptual_hash: number[];
-  ocr_status: string;
+  ocr_status: OcrStatus;
   created_at: string;
 }
 

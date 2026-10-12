@@ -253,6 +253,15 @@ export function ScreenshotDetail({ screenshotId, onBack, searchQuery, screenshot
               {detail.ocr_text && (
                 <span className="text-[10px] text-text-muted font-mono">{wordCount} words</span>
               )}
+              {!detail.ocr_text && detail.ocr_status === "pending" && (
+                <span className="text-[10px] font-mono text-text-muted">Queued</span>
+              )}
+              {!detail.ocr_text && detail.ocr_status === "processing" && (
+                <span className="text-[10px] font-mono text-text-muted">Processing</span>
+              )}
+              {!detail.ocr_text && detail.ocr_status === "failed" && (
+                <span className="text-[10px] font-mono text-text-muted">Needs retry</span>
+              )}
             </div>
             {detail.ocr_text && (
               <Button
@@ -289,7 +298,15 @@ export function ScreenshotDetail({ screenshotId, onBack, searchQuery, screenshot
               </div>
             ) : (
               <div className="flex items-center justify-center h-full px-4">
-                <p className="text-xs text-text-muted">No OCR text available</p>
+                <p className="text-xs text-text-muted">
+                  {detail.ocr_status === "processing"
+                    ? "OCR is running on this screenshot…"
+                    : detail.ocr_status === "failed"
+                      ? "OCR failed for this screenshot — it will be retried automatically."
+                      : detail.ocr_status === "done"
+                        ? "No text found in this screenshot."
+                        : "OCR hasn't run yet — this screenshot is still queued."}
+                </p>
               </div>
             )}
           </ScrollArea>

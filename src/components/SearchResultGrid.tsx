@@ -85,7 +85,7 @@ export function SearchResultGrid({ results, onSelectResult }: SearchResultGridPr
               </p>
             )}
             <p className="text-[11px] text-text-secondary line-clamp-3 leading-relaxed">
-              <HighlightedText html={result.matched_text} />
+              {result.matched_text?.trim() ? <HighlightedText html={result.matched_text} /> : "No text snippet"}
             </p>
           </div>
         </button>

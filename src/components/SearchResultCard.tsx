@@ -52,7 +52,7 @@ export function SearchResultCard({ result, index, onClick }: SearchResultCardPro
         </div>
 
         <p className="text-sm text-text-secondary leading-[1.55] line-clamp-2 max-w-[70ch]">
-          <HighlightedText html={result.matched_text} />
+          {result.matched_text?.trim() ? <HighlightedText html={result.matched_text} /> : "No text snippet"}
         </p>
 
         <div className="flex items-center gap-4 mt-3">

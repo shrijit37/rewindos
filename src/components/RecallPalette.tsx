@@ -181,7 +181,7 @@ export function RecallPalette({ open, onClose, onOpenResult, onRewindTo }: Recal
                     </span>
                   </div>
                   <div className="text-xs text-text-muted mt-0.5 truncate">
-                    <HighlightedText html={r.matched_text} />
+                    {r.matched_text?.trim() ? <HighlightedText html={r.matched_text} /> : "No text snippet"}
                   </div>
                   <div className="flex items-center gap-2.5 mt-1">
                     {r.app_name && (
