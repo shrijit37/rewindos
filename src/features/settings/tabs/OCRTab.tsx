@@ -29,7 +29,8 @@ interface TabProps {
 
 export function OCRTab({ config, update }: TabProps) {
   const isApi = config.ocr.engine === "api";
-  const [testResult, setTestResult] = useState<string | null>(null);
+  const isGateway = config.ocr.engine === "gateway";
+  const isRemote = isApi || isGateway;
 
   const debouncedBaseUrl = useDebounced(config.ocr.api_base_url, 500);
   const debouncedApiKey = useDebounced(config.ocr.api_key, 500);
@@ -65,7 +66,8 @@ export function OCRTab({ config, update }: TabProps) {
           <SelectContent>
             <SelectItem value="tesseract">Tesseract</SelectItem>
             <SelectItem value="paddleocr">PaddleOCR</SelectItem>
-            <SelectItem value="api">API (cloud)</SelectItem>
+            <SelectItem value="api">API (OpenAI-compatible)</SelectItem>
+            <SelectItem value="gateway">Gateway (custom)</SelectItem>
           </SelectContent>
         </Select>
       </Field>
@@ -95,11 +97,13 @@ export function OCRTab({ config, update }: TabProps) {
           </Field>
         </>
       )}
-      {isApi && (
+      {(isApi || isGateway) && (
         <>
           <Field
             label="Base URL"
-            hint="Any OpenAI-compatible vision endpoint (OpenAI, OpenRouter, self-hosted gateway). Takes effect after a daemon restart."
+            hint={isGateway
+              ? "Gateway root, e.g. https://host (no /v1 suffix needed). Takes effect after a daemon restart."
+              : "Any OpenAI-compatible vision endpoint (OpenAI, OpenRouter, self-hosted gateway). Takes effect after a daemon restart."}
           >
             <TextInput
               value={config.ocr.api_base_url}
@@ -114,20 +118,22 @@ export function OCRTab({ config, update }: TabProps) {
               autoComplete="off"
             />
           </Field>
-          <Field label="Model">
-            <>
-              <TextInput
-                value={config.ocr.api_model}
-                onChange={(v) => update("ocr", "api_model", v)}
-                list="ocr-model-options"
-              />
-              <datalist id="ocr-model-options">
-                {(models ?? []).map((m) => (
-                  <option key={m} value={m} />
-                ))}
-              </datalist>
-            </>
-          </Field>
+          {isApi && (
+            <Field label="Model">
+              <>
+                <TextInput
+                  value={config.ocr.api_model}
+                  onChange={(v) => update("ocr", "api_model", v)}
+                  list="ocr-model-options"
+                />
+                <datalist id="ocr-model-options">
+                  {(models ?? []).map((m) => (
+                    <option key={m} value={m} />
+                  ))}
+                </datalist>
+              </>
+            </Field>
+          )}
           <Field label="Timeout (seconds)">
             <NumberInput
               value={config.ocr.api_timeout_secs}
@@ -168,22 +174,31 @@ export function OCRTab({ config, update }: TabProps) {
               )}
             </div>
           </Field>
-          <Field label="API mode note">
-            <span className="font-mono text-[11px] text-text-muted">
-              Transcription only — no word-level overlays; no local OCR binary is used.
-            </span>
-          </Field>
+          {isApi && (
+            <Field label="API mode note">
+              <span className="font-mono text-[11px] text-text-muted">
+                Transcription only — no word-level overlays; no local OCR binary is used.
+              </span>
+            </Field>
+          )}
           <div className="py-3.5 border-b border-line">
             <p className="font-mono text-[11px] text-signal-paused leading-relaxed max-w-[72ch]">
               Privacy: every captured screenshot is uploaded to your endpoint for transcription.
               Do not use with sensitive content unless you trust the provider.
             </p>
           </div>
+          {isGateway && (
+            <Field label="Engine note">
+              <span className="font-mono text-[11px] text-text-muted">
+                Fixed gateway OCR engine with word boxes; no model to pick.
+              </span>
+            </Field>
+          )}
         </>
       )}
       <Field
         label="Max Workers"
-        hint={isApi ? "Caps concurrent API requests (rate limits)." : undefined}
+        hint={isRemote ? "Caps concurrent API requests (rate limits)." : undefined}
       >
         <NumberInput
           value={config.ocr.max_workers}

@@ -240,19 +240,33 @@ impl OpenAiEmbeddingClient {
     }
 
     /// Health check via `GET {base}/models` — never `POST /embeddings`,
-    /// so a check does not bill an embedding call.
-    pub async fn health_check(&self) -> bool {
+    /// so a check does not bill an embedding call. `Ok(false)` only on
+    /// connect/timeout; `Err` carries HTTP failures for the Settings UI.
+    pub async fn health_check(&self) -> Result<bool> {
         let url = format!("{}/models", self.base_url);
-        matches!(
-            self.with_auth(
+        let response = match self
+            .with_auth(
                 self.client
                     .get(&url)
-                    .timeout(std::time::Duration::from_secs(15))
+                    .timeout(std::time::Duration::from_secs(15)),
             )
             .send()
-            .await,
-            Ok(r) if r.status().is_success()
-        )
+            .await
+        {
+            Ok(r) => r,
+            Err(e) if e.is_connect() || e.is_timeout() => return Ok(false),
+            Err(e) => return Err(CoreError::Embedding(format!("health check failed: {e}"))),
+        };
+        if response.status().is_success() {
+            Ok(true)
+        } else {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            let snippet: String = text.chars().take(500).collect();
+            Err(CoreError::Embedding(format!(
+                "embedding API returned {status}: {snippet}"
+            )))
+        }
     }
 
     /// Model ids from `GET {base}/models` (`data[].id`), sorted.
@@ -302,13 +316,132 @@ impl OpenAiEmbeddingClient {
     }
 }
 
+/// Strip a trailing `/v1` (and slashes) so a gateway root works whether the
+/// user enters `https://host` or `https://host/v1`.
+fn gateway_root(base: &str) -> String {
+    let s = base.trim_end_matches('/').to_string();
+    match s.strip_suffix("/v1") {
+        Some(root) => root.trim_end_matches('/').to_string(),
+        None => s,
+    }
+}
+
+/// Custom gateway embedding client (self-hosted semantic-OCR gateway).
+///
+/// Vectors come from the gateway's OpenAI-shaped `POST {root}/v1/embeddings`;
+/// checks use its unauthenticated `GET {root}/health` — the gateway exposes
+/// no `/models` endpoint, so the OpenAI client's probe 404s there.
+/// Graceful degradation matches `OllamaClient`: connect/timeout → `Ok(None)`.
+pub struct GatewayEmbeddingClient {
+    root: String,
+    api_key: String,
+    model: String,
+    client: reqwest::Client,
+}
+
+impl GatewayEmbeddingClient {
+    pub fn new(base_url: &str, api_key: &str, model: &str) -> Self {
+        Self {
+            root: gateway_root(base_url),
+            api_key: api_key.to_string(),
+            model: model.to_string(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_default(),
+        }
+    }
+
+    fn with_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if self.api_key.is_empty() {
+            req
+        } else {
+            req.bearer_auth(&self.api_key)
+        }
+    }
+
+    /// Generate an embedding for the given text.
+    /// Returns `None` when the gateway is unreachable (connect/timeout).
+    pub async fn embed(&self, text: &str) -> Result<Option<Vec<f32>>> {
+        let url = format!("{}/v1/embeddings", self.root);
+        let body = serde_json::json!({
+            "model": self.model,
+            "input": text,
+        });
+        let response = match self.with_auth(self.client.post(&url).json(&body)).send().await {
+            Ok(r) => r,
+            Err(e) if e.is_connect() || e.is_timeout() => return Ok(None),
+            Err(e) => return Err(CoreError::Embedding(format!("request failed: {e}"))),
+        };
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            let snippet: String = text.chars().take(500).collect();
+            return Err(CoreError::Embedding(format!(
+                "embedding gateway returned {status}: {snippet}"
+            )));
+        }
+        let parsed: OpenAiEmbeddingResponse = response
+            .json()
+            .await
+            .map_err(|e| CoreError::Embedding(format!("parse response: {e}")))?;
+        match parsed.data.into_iter().next() {
+            Some(d) => Ok(Some(d.embedding)),
+            None => Err(CoreError::Embedding("embedding gateway returned no data".to_string())),
+        }
+    }
+
+    /// `GET {root}/health` needs no auth. `Ok(false)` only on
+    /// connect/timeout; `Err` carries HTTP failures for the Settings UI.
+    pub async fn health_check(&self) -> Result<bool> {
+        let url = format!("{}/health", self.root);
+        let response = match self
+            .with_auth(
+                self.client
+                    .get(&url)
+                    .timeout(std::time::Duration::from_secs(15)),
+            )
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) if e.is_connect() || e.is_timeout() => return Ok(false),
+            Err(e) => return Err(CoreError::Embedding(format!("health check failed: {e}"))),
+        };
+        if response.status().is_success() {
+            Ok(true)
+        } else {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            let snippet: String = text.chars().take(500).collect();
+            Err(CoreError::Embedding(format!(
+                "gateway health returned {status}: {snippet}"
+            )))
+        }
+    }
+
+    /// The gateway runs one fixed embedding model — report the configured one
+    /// so the Settings datalist still offers something.
+    pub async fn list_models(&self) -> Result<Vec<String>> {
+        Ok(vec![self.model.clone()])
+    }
+
+    /// Get the model name this client is configured for.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+}
+
 /// Unified embedding dispatch over the configured `SemanticConfig.provider`.
 ///
 /// `"ollama"` (default) delegates to `OllamaClient`; `"api"` delegates to
-/// `OpenAiEmbeddingClient`. Anything else falls back to Ollama.
+/// `OpenAiEmbeddingClient`; `"gateway"` delegates to `GatewayEmbeddingClient`
+/// (custom semantic-OCR gateway: `POST {root}/v1/embeddings`,
+/// `GET {root}/health`). Anything else falls back to Ollama.
 pub enum EmbeddingClient {
     Ollama(OllamaClient),
     Api(OpenAiEmbeddingClient),
+    Gateway(GatewayEmbeddingClient),
 }
 
 impl EmbeddingClient {
@@ -332,6 +465,22 @@ impl EmbeddingClient {
                 &c.api_key,
                 &c.api_model,
             )))
+        } else if c.provider == "gateway" {
+            if c.api_base_url.trim().is_empty() {
+                return Err(CoreError::Embedding(
+                    "gateway provider selected but api_base_url is empty".to_string(),
+                ));
+            }
+            if c.api_model.trim().is_empty() {
+                return Err(CoreError::Embedding(
+                    "gateway provider selected but api_model is empty".to_string(),
+                ));
+            }
+            Ok(Self::Gateway(GatewayEmbeddingClient::new(
+                &c.api_base_url,
+                &c.api_key,
+                &c.api_model,
+            )))
         } else {
             Ok(Self::Ollama(OllamaClient::new(&c.ollama_url, &c.model)))
         }
@@ -345,23 +494,29 @@ impl EmbeddingClient {
         let raw = match self {
             Self::Ollama(c) => c.embed(text).await?,
             Self::Api(c) => c.embed(text).await?,
+            Self::Gateway(c) => c.embed(text).await?,
         };
         Ok(raw.map(|v| normalize_dimensions(v, dimensions)))
     }
 
-    pub async fn health_check(&self) -> bool {
+    /// `Ok(true)` reachable, `Ok(false)` only on connect/timeout, `Err`
+    /// carries HTTP failures so the Settings UI can say why a check failed.
+    pub async fn health_check(&self) -> Result<bool> {
         match self {
-            Self::Ollama(c) => c.health_check().await,
+            Self::Ollama(c) => Ok(c.health_check().await),
             Self::Api(c) => c.health_check().await,
+            Self::Gateway(c) => c.health_check().await,
         }
     }
 
     /// List available model ids for the Settings UI datalist.
-    /// Ollama reports local tags; API reports `GET {base}/models` ids.
+    /// Ollama reports local tags; API reports `GET {base}/models` ids;
+    /// gateway reports the configured model (it runs one fixed model).
     pub async fn list_models(&self) -> Result<Vec<String>> {
         match self {
             Self::Ollama(c) => c.list_models().await,
             Self::Api(c) => c.list_models().await,
+            Self::Gateway(c) => c.list_models().await,
         }
     }
 
@@ -369,11 +524,13 @@ impl EmbeddingClient {
         match self {
             Self::Ollama(c) => c.model(),
             Self::Api(c) => c.model(),
+            Self::Gateway(c) => c.model(),
         }
     }
 
+    /// True for any remote backend (`Api` or `Gateway`); false for local Ollama.
     pub fn is_api(&self) -> bool {
-        matches!(self, Self::Api(_))
+        !matches!(self, Self::Ollama(_))
     }
 }
 
@@ -424,5 +581,112 @@ mod tests {
         assert_eq!(normalize_dimensions(vec![1.0, 2.0], 2), vec![1.0, 2.0]);
         assert_eq!(normalize_dimensions(vec![1.0, 2.0, 3.0], 2), vec![1.0, 2.0]);
         assert_eq!(normalize_dimensions(vec![1.0], 3), vec![1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn gateway_root_strips_v1_and_slashes() {
+        assert_eq!(gateway_root("https://host/v1"), "https://host");
+        assert_eq!(gateway_root("https://host/v1/"), "https://host");
+        assert_eq!(gateway_root("https://host"), "https://host");
+        assert_eq!(gateway_root("https://host/"), "https://host");
+    }
+
+    #[test]
+    fn from_config_gateway_requires_base_url_and_model() {
+        let mut c = SemanticConfig::default();
+        c.provider = "gateway".to_string();
+        assert!(EmbeddingClient::from_config(&c).is_err());
+        c.api_base_url = "https://gateway.local".to_string();
+        assert!(EmbeddingClient::from_config(&c).is_err());
+        c.api_model = "nomic-embed-text".to_string();
+        let client = EmbeddingClient::from_config(&c).unwrap();
+        assert!(client.is_api());
+        assert_eq!(client.model(), "nomic-embed-text");
+    }
+
+    /// Route-aware stub: `GET /health` → ok, `POST /v1/embeddings` →
+    /// OpenAI-shaped vector. Anything else 404s (like the real gateway's
+    /// missing `/v1/models`).
+    async fn spawn_gateway_stub() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else { break };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut req = Vec::new();
+                    let mut buf = vec![0u8; 8192];
+                    let mut content_len = 0usize;
+                    let mut header_len = None::<usize>;
+                    while header_len.map(|h| req.len() < h + content_len).unwrap_or(true) {
+                        match socket.read(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                            Err(_) => break,
+                        };
+                        if header_len.is_none() {
+                            if let Some(p) = find_stub_header_end(&req) {
+                                header_len = Some(p);
+                                content_len = parse_stub_content_length(&req[..p]);
+                            }
+                        }
+                        if req.len() > 8_000_000 {
+                            break;
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&req);
+                    let first_line = head.lines().next().unwrap_or("");
+                    let (status, body) = if first_line.starts_with("GET /health") {
+                        (200, "{\"status\":\"ok\"}".to_string())
+                    } else if first_line.starts_with("POST /v1/embeddings") {
+                        (200, "{\"object\":\"list\",\"data\":[{\"object\":\"embedding\",\"index\":0,\"embedding\":[0.1,0.2,0.3]}]}".to_string())
+                    } else {
+                        (404, "{\"detail\":\"Not Found\"}".to_string())
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn find_stub_header_end(req: &[u8]) -> Option<usize> {
+        req.windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|p| p + 4)
+    }
+
+    fn parse_stub_content_length(head: &[u8]) -> usize {
+        String::from_utf8_lossy(head)
+            .lines()
+            .skip(1)
+            .filter_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                (k.trim().eq_ignore_ascii_case("content-length"))
+                    .then(|| v.trim().parse().unwrap_or(0))
+            })
+            .next()
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn gateway_embed_and_health_hit_stub() {
+        let (root, handle) = spawn_gateway_stub().await;
+        let c = GatewayEmbeddingClient::new(&root, "k", "m");
+        assert!(c.health_check().await.unwrap());
+        assert_eq!(c.embed("hi").await.unwrap(), Some(vec![0.1, 0.2, 0.3]));
+        // A `/v1`-suffixed base resolves to the same root.
+        let c2 = GatewayEmbeddingClient::new(&format!("{root}/v1"), "", "m");
+        assert!(c2.health_check().await.unwrap());
+        // The OpenAI-shaped probe 404s here — the failure this client avoids.
+        let openai = OpenAiEmbeddingClient::new(&format!("{root}/v1"), "", "m");
+        assert!(!openai.health_check().await.unwrap_or(false));
+        handle.abort();
     }
 }

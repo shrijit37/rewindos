@@ -95,6 +95,9 @@ export function AITab({ config, update }: TabProps) {
     if (id === "api" && !config.semantic.api_base_url) {
       update("semantic", "api_base_url", "https://api.openai.com/v1");
     }
+    if (id === "gateway" && !config.semantic.api_model) {
+      update("semantic", "api_model", "nomic-embed-text");
+    }
     setSemanticTestResult(null);
   };
 
@@ -216,6 +219,7 @@ export function AITab({ config, update }: TabProps) {
           <SelectContent>
             <SelectItem value="ollama" className="font-mono">Ollama</SelectItem>
             <SelectItem value="api" className="font-mono">OpenAI-compatible API</SelectItem>
+            <SelectItem value="gateway" className="font-mono">Custom gateway</SelectItem>
           </SelectContent>
         </Select>
       </Field>
@@ -227,11 +231,13 @@ export function AITab({ config, update }: TabProps) {
           />
         </Field>
       )}
-      {config.semantic.provider === "api" && (
+      {(config.semantic.provider === "api" || config.semantic.provider === "gateway") && (
         <>
           <Field
             label="Base URL"
-            hint="Any OpenAI-compatible embeddings endpoint. Takes effect after a daemon restart."
+            hint={config.semantic.provider === "gateway"
+              ? "Gateway root, e.g. https://host (no /v1 suffix needed). Takes effect after a daemon restart."
+              : "Any OpenAI-compatible embeddings endpoint. Takes effect after a daemon restart."}
           >
             <TextInput
               value={config.semantic.api_base_url}

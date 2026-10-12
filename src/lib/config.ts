@@ -19,7 +19,7 @@ export interface AppConfig {
   };
   ocr: {
     enabled: boolean;
-    engine: "tesseract" | "paddleocr" | "api";
+    engine: "tesseract" | "paddleocr" | "api" | "gateway";
     tesseract_lang: string;
     max_workers: number;
     model_dir: string;
@@ -40,7 +40,7 @@ export interface AppConfig {
     ollama_url: string;
     model: string;
     embedding_dimensions: number;
-    provider: "ollama" | "api";
+    provider: "ollama" | "api" | "gateway";
     api_base_url: string;
     api_key: string;
     api_model: string;

@@ -190,15 +190,21 @@ async fn run_backfill(batch_size: usize) -> anyhow::Result<()> {
     let client = EmbeddingClient::from_config(&config.semantic)
         .map_err(|e| anyhow::anyhow!("invalid semantic config: {e}"))?;
 
-    if !client.health_check().await {
-        if client.is_api() {
+    match client.health_check().await {
+        Ok(true) => {}
+        Ok(false) if client.is_api() => {
             anyhow::bail!("embedding API is not reachable. Check api_base_url and api_key.");
         }
-        anyhow::bail!(
-            "Ollama is not reachable at {}. Start Ollama and ensure '{}' model is pulled.",
-            config.semantic.ollama_url,
-            config.semantic.model,
-        );
+        Ok(false) => {
+            anyhow::bail!(
+                "Ollama is not reachable at {}. Start Ollama and ensure '{}' model is pulled.",
+                config.semantic.ollama_url,
+                config.semantic.model,
+            );
+        }
+        Err(e) => {
+            anyhow::bail!("embedding backend health check failed: {e}");
+        }
     }
 
     println!("Connected ({}), starting backfill...", client.model());
@@ -246,7 +252,7 @@ async fn run_backfill_ocr(batch_size: usize) -> anyhow::Result<()> {
     let db_path = config.db_path()?;
     let db = Arc::new(Mutex::new(Database::open(&db_path)?));
 
-    // API mode calls the vision endpoint instead of touching sidecars.
+    // API/gateway modes call the remote endpoint instead of touching sidecars.
     let engine = ocr::OcrEngine::from_config(&config.ocr.engine);
     let api_client: Option<Arc<ocr::ApiOcrClient>> = if engine == ocr::OcrEngine::Api {
         match ocr::ApiOcrClient::from_config(&config.ocr) {
@@ -259,12 +265,23 @@ async fn run_backfill_ocr(batch_size: usize) -> anyhow::Result<()> {
     } else {
         None
     };
+    let gateway_client: Option<Arc<ocr::GatewayOcrClient>> = if engine == ocr::OcrEngine::Gateway {
+        match ocr::GatewayOcrClient::from_config(&config.ocr) {
+            Ok(c) => {
+                println!("gateway OCR configured, starting backfill...");
+                Some(Arc::new(c))
+            }
+            Err(e) => anyhow::bail!("invalid gateway OCR config: {e}"),
+        }
+    } else {
+        None
+    };
 
     let max_workers = (config.ocr.max_workers as usize).max(1);
 
     // Spawn N sidecar workers for true parallelism (each is its own Python
-    // process). Skipped entirely in API mode.
-    let sidecars: Vec<Arc<paddle_ocr::PaddleOcrSidecar>> = if api_client.is_none() {
+    // process). Skipped entirely in API/gateway modes.
+    let sidecars: Vec<Arc<paddle_ocr::PaddleOcrSidecar>> = if api_client.is_none() && gateway_client.is_none() {
         // Find the PaddleOCR worker script
         let script_path = paddle_ocr::find_worker_script()
             .ok_or_else(|| anyhow::anyhow!(
@@ -325,8 +342,10 @@ async fn run_backfill_ocr(batch_size: usize) -> anyhow::Result<()> {
             let permit = semaphore.clone().acquire_owned().await.unwrap();
             let idx = worker_idx.fetch_add(1, Ordering::Relaxed) as usize % max_workers;
             let api = api_client.clone();
-            let sidecar = if api.is_none() { Some(sidecars[idx].clone()) } else { None };
-            let label = if api_client.is_some() { "API OCR" } else { "PaddleOCR" };
+            let gateway = gateway_client.clone();
+            let remote = api.is_some() || gateway.is_some();
+            let sidecar = if remote { None } else { Some(sidecars[idx].clone()) };
+            let label = if gateway.is_some() { "gateway OCR" } else if api.is_some() { "API OCR" } else { "PaddleOCR" };
             let db = db.clone();
             let total_processed = total_processed.clone();
             let total_errors = total_errors.clone();
@@ -351,11 +370,15 @@ async fn run_backfill_ocr(batch_size: usize) -> anyhow::Result<()> {
                     }
                 }
 
-                // Re-run OCR (vision API in API mode, PaddleOCR sidecar otherwise)
-                let ocr_result = match (api, sidecar) {
-                    (Some(api), _) => api.run_api_ocr(std::path::Path::new(&file_path)).await,
-                    (None, Some(sidecar)) => sidecar.run_ocr(std::path::Path::new(&file_path)).await,
-                    (None, None) => unreachable!("local OCR path always builds a sidecar"),
+                // Re-run OCR (remote endpoint in API/gateway modes, sidecar otherwise)
+                let ocr_result = if let Some(api) = &api {
+                    api.run_api_ocr(std::path::Path::new(&file_path)).await
+                } else if let Some(gateway) = &gateway {
+                    gateway.run_gateway_ocr(std::path::Path::new(&file_path)).await
+                } else if let Some(sidecar) = &sidecar {
+                    sidecar.run_ocr(std::path::Path::new(&file_path)).await
+                } else {
+                    unreachable!("local OCR path always builds a sidecar")
                 };
                 match ocr_result {
                     Ok(output) => {
@@ -635,9 +658,10 @@ async fn run_daemon() -> anyhow::Result<()> {
         "rewindos-daemon starting"
     );
 
-    // Check tesseract availability (API mode never spawns local binaries)
+    // Check tesseract availability (remote OCR modes never spawn local binaries)
     let ocr_engine = ocr::OcrEngine::from_config(&config.ocr.engine);
-    if config.ocr.enabled && ocr_engine != ocr::OcrEngine::Api && !ocr::is_tesseract_available().await {
+    let remote_ocr = matches!(ocr_engine, ocr::OcrEngine::Api | ocr::OcrEngine::Gateway);
+    if config.ocr.enabled && !remote_ocr && !ocr::is_tesseract_available().await {
         warn!("tesseract not found — OCR will be disabled");
     }
 
@@ -651,18 +675,26 @@ async fn run_daemon() -> anyhow::Result<()> {
     let db = Arc::new(Mutex::new(db));
 
     // Embedding backend probe. Ollama path: always probe regardless of
-    // config.semantic.enabled (auto-detect + pull). API path: never contact
-    // ollama_url and never pull — just health-check the configured endpoint.
-    let ollama_client: Option<Arc<EmbeddingClient>> = if config.semantic.provider == "api" {
+    // config.semantic.enabled (auto-detect + pull). API/gateway paths: never
+    // contact ollama_url and never pull — just health-check the endpoint.
+    let ollama_client: Option<Arc<EmbeddingClient>> = if config.semantic.provider == "api"
+        || config.semantic.provider == "gateway"
+    {
         match EmbeddingClient::from_config(&config.semantic) {
-            Ok(client) if client.health_check().await => {
-                info!(model = %client.model(), "embedding API reachable — semantic search enabled");
-                Some(Arc::new(client))
-            }
-            Ok(_) => {
-                info!("embedding API not reachable — using keyword-only search");
-                None
-            }
+            Ok(client) => match client.health_check().await {
+                Ok(true) => {
+                    info!(model = %client.model(), "embedding API reachable — semantic search enabled");
+                    Some(Arc::new(client))
+                }
+                Ok(false) => {
+                    info!("embedding API not reachable — using keyword-only search");
+                    None
+                }
+                Err(e) => {
+                    warn!(error = %e, "embedding backend health check failed — using keyword-only search");
+                    None
+                }
+            },
             Err(e) => {
                 warn!(error = %e, "invalid semantic API config — using keyword-only search");
                 None

@@ -1886,10 +1886,14 @@ async fn chat_list_models(chat: rewindos_core::config::ChatConfig) -> Result<Vec
 async fn ocr_health_check(ocr: rewindos_core::config::OcrConfig) -> Result<bool, String> {
     match rewindos_core::ocr::OcrEngine::from_config(&ocr.engine) {
         rewindos_core::ocr::OcrEngine::Api => {
-            match rewindos_core::ocr::ApiOcrClient::from_config(&ocr) {
-                Ok(client) => Ok(client.health_check().await),
-                Err(e) => Err(e.to_string()),
-            }
+            let client = rewindos_core::ocr::ApiOcrClient::from_config(&ocr)
+                .map_err(|e| e.to_string())?;
+            client.health_check().await.map_err(|e| e.to_string())
+        }
+        rewindos_core::ocr::OcrEngine::Gateway => {
+            let client = rewindos_core::ocr::GatewayOcrClient::from_config(&ocr)
+                .map_err(|e| e.to_string())?;
+            client.health_check().await.map_err(|e| e.to_string())
         }
         rewindos_core::ocr::OcrEngine::Tesseract => {
             Ok(rewindos_core::ocr::is_tesseract_available().await)
@@ -1902,14 +1906,15 @@ async fn ocr_health_check(ocr: rewindos_core::config::OcrConfig) -> Result<bool,
 
 #[tauri::command]
 async fn ocr_list_models(ocr: rewindos_core::config::OcrConfig) -> Result<Vec<String>, String> {
-    if rewindos_core::ocr::OcrEngine::from_config(&ocr.engine)
-        != rewindos_core::ocr::OcrEngine::Api
-    {
-        return Ok(vec![]);
+    match rewindos_core::ocr::OcrEngine::from_config(&ocr.engine) {
+        rewindos_core::ocr::OcrEngine::Gateway => Ok(vec![]),
+        rewindos_core::ocr::OcrEngine::Api => {
+            let client = rewindos_core::ocr::ApiOcrClient::from_config(&ocr)
+                .map_err(|e| e.to_string())?;
+            client.list_models().await.map_err(|e| e.to_string())
+        }
+        _ => Ok(vec![]),
     }
-    let client =
-        rewindos_core::ocr::ApiOcrClient::from_config(&ocr).map_err(|e| e.to_string())?;
-    client.list_models().await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1918,7 +1923,10 @@ async fn semantic_health_check(
 ) -> Result<bool, String> {
     let client = rewindos_core::embedding::EmbeddingClient::from_config(&semantic)
         .map_err(|e| e.to_string())?;
-    Ok(client.health_check().await)
+    // `Ok(false)` = connect/timeout unreachable; `Err` carries the provider's
+    // answer (401/404/...) so the Test button shows why instead of a flat
+    // "unreachable" for every value.
+    client.health_check().await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]

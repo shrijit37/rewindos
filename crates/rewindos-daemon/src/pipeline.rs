@@ -7,7 +7,7 @@ use rewindos_core::config::AppConfig;
 use rewindos_core::db::Database;
 use rewindos_core::embedding::EmbeddingClient;
 use rewindos_core::hasher::{self, PerceptualHasher};
-use rewindos_core::ocr::{self, ApiOcrClient, OcrEngine};
+use rewindos_core::ocr::{self, ApiOcrClient, GatewayOcrClient, OcrEngine};
 use rewindos_core::paddle_ocr::{self, PaddleOcrSidecar};
 use rewindos_core::schema::{EmbedRequest, NewScreenshot, OcrStatus, ProcessedFrame, RawFrame};
 use tokio::sync::mpsc;
@@ -369,10 +369,11 @@ async fn run_ocr_stage(
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_workers));
     let engine = OcrEngine::from_config(&config.ocr.engine);
 
-    // API mode: build the vision client once. Local inference is never
-    // touched on this path — no worker script lookup, no sidecar spawn,
-    // no idle reaper. Invalid config warns here; each frame then fails
-    // with "client not configured" and is marked Failed (daemon stays up).
+    // API mode: build the vision client once. Gateway mode: build the gateway
+    // client once. Local inference is never touched on either path — no worker
+    // script lookup, no sidecar spawn, no idle reaper. Invalid config warns
+    // here; each frame then fails with "client not configured" and is marked
+    // Failed (daemon stays up).
     let api_client: Option<Arc<ApiOcrClient>> = if engine == OcrEngine::Api {
         match ApiOcrClient::from_config(&config.ocr) {
             Ok(client) => {
@@ -381,6 +382,20 @@ async fn run_ocr_stage(
             }
             Err(e) => {
                 warn!(error = %e, "invalid API OCR config — screenshots will be marked Failed");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let gateway_client: Option<Arc<GatewayOcrClient>> = if engine == OcrEngine::Gateway {
+        match GatewayOcrClient::from_config(&config.ocr) {
+            Ok(client) => {
+                info!(base_url = %config.ocr.api_base_url, "gateway OCR configured");
+                Some(Arc::new(client))
+            }
+            Err(e) => {
+                warn!(error = %e, "invalid gateway OCR config — screenshots will be marked Failed");
                 None
             }
         }
@@ -452,6 +467,7 @@ async fn run_ocr_stage(
         let effective_engine = effective_engine.clone();
         let paddle_sidecar = paddle_sidecar.clone();
         let api_client = api_client.clone();
+        let gateway_client = gateway_client.clone();
 
         tokio::spawn(async move {
             let _permit = permit;
@@ -476,6 +492,7 @@ async fn run_ocr_stage(
                 &lang,
                 paddle_sidecar.as_ref(),
                 api_client.as_deref(),
+                gateway_client.as_deref(),
             )
             .await;
 
@@ -624,19 +641,25 @@ async fn run_embed_stage(
         }
     };
 
-    if !client.health_check().await {
-        if client.is_api() {
+    match client.health_check().await {
+        Ok(true) if client.is_api() => {
+            info!(model = %client.model(), "embed stage connected to embedding API");
+        }
+        Ok(true) => {
+            info!("embed stage connected to Ollama");
+        }
+        Ok(false) if client.is_api() => {
             warn!("embedding API is not reachable, embeddings will be skipped");
-        } else {
+        }
+        Ok(false) => {
             warn!(
                 "Ollama is not reachable at {}, embeddings will be skipped",
                 semantic_config.ollama_url
             );
         }
-    } else if client.is_api() {
-        info!(model = %client.model(), "embed stage connected to embedding API");
-    } else {
-        info!("embed stage connected to Ollama");
+        Err(e) => {
+            warn!(error = %e, "embedding backend health check failed, embeddings will be skipped");
+        }
     }
 
     while let Some(req) = embed_rx.recv().await {
