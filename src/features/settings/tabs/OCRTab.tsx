@@ -31,6 +31,7 @@ export function OCRTab({ config, update }: TabProps) {
   const isApi = config.ocr.engine === "api";
   const isGateway = config.ocr.engine === "gateway";
   const isRemote = isApi || isGateway;
+  const [testResult, setTestResult] = useState<string | null>(null);
 
   const debouncedBaseUrl = useDebounced(config.ocr.api_base_url, 500);
   const debouncedApiKey = useDebounced(config.ocr.api_key, 500);
