@@ -316,17 +316,23 @@ impl OpenAiEmbeddingClient {
     }
 }
 
-/// Strip a trailing `/v1` (and slashes) so a gateway root works whether the
-/// user enters `https://host` or `https://host/v1`.
-fn gateway_root(base: &str) -> String {
-    let s = base.trim_end_matches('/').to_string();
-    match s.strip_suffix("/v1") {
-        Some(root) => root.trim_end_matches('/').to_string(),
-        None => s,
+/// Gateway root: peel trailing endpoint segments so a full endpoint URL
+/// (`…/v1`, `…/api/embeddings`, `…/v1/ocr`, …) still resolves to the host root.
+/// Only path segments are stripped — never the host itself.
+pub(crate) fn gateway_root(base: &str) -> String {
+    let mut s = base.trim_end_matches('/').to_string();
+    loop {
+        let stripped = ["v1", "embeddings", "embed", "api", "ocr"]
+            .iter()
+            .find_map(|seg| s.strip_suffix(&format!("/{seg}")).map(str::to_string));
+        match stripped {
+            Some(root) => s = root.trim_end_matches('/').to_string(),
+            None => return s,
+        }
     }
 }
 
-/// Custom gateway embedding client (self-hosted semantic-OCR gateway).
+ /// Custom gateway embedding client (self-hosted semantic-OCR gateway).
 ///
 /// Vectors come from the gateway's OpenAI-shaped `POST {root}/v1/embeddings`;
 /// checks use its unauthenticated `GET {root}/health` — the gateway exposes
@@ -363,10 +369,14 @@ impl GatewayEmbeddingClient {
     /// Generate an embedding for the given text.
     /// Returns `None` when the gateway is unreachable (connect/timeout).
     pub async fn embed(&self, text: &str) -> Result<Option<Vec<f32>>> {
+        // Gateway rejects inputs over 4000 chars (413) — truncate by chars.
+        // A prefix embedding keeps the screenshot searchable; a 413 would
+        // drop it from semantic search entirely.
+        let input: String = text.chars().take(4000).collect();
         let url = format!("{}/v1/embeddings", self.root);
         let body = serde_json::json!({
             "model": self.model,
-            "input": text,
+            "input": input,
         });
         let response = match self.with_auth(self.client.post(&url).json(&body)).send().await {
             Ok(r) => r,
@@ -589,6 +599,10 @@ mod tests {
         assert_eq!(gateway_root("https://host/v1/"), "https://host");
         assert_eq!(gateway_root("https://host"), "https://host");
         assert_eq!(gateway_root("https://host/"), "https://host");
+        assert_eq!(gateway_root("https://host/api/embeddings"), "https://host");
+        assert_eq!(gateway_root("https://host/v1/embeddings"), "https://host");
+        assert_eq!(gateway_root("https://host/v1/ocr"), "https://host");
+        assert_eq!(gateway_root("https://host/subpath/v1"), "https://host/subpath");
     }
 
     #[test]

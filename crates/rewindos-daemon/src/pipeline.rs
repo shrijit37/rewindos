@@ -365,7 +365,7 @@ async fn run_ocr_stage(
 ) {
     let lang = config.ocr.tesseract_lang.clone();
     let ocr_enabled = config.ocr.enabled;
-    let max_workers = config.ocr.max_workers as usize;
+    let max_workers = (config.ocr.max_workers as usize).max(1);
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_workers));
     let engine = OcrEngine::from_config(&config.ocr.engine);
 

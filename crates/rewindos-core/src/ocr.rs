@@ -517,7 +517,7 @@ impl GatewayOcrClient {
             return Err(CoreError::Ocr("gateway OCR selected but api_base_url is empty".to_string()));
         }
         Ok(Self {
-            root: gateway_ocr_root(&c.api_base_url),
+            root: crate::embedding::gateway_root(&c.api_base_url),
             api_key: c.api_key.clone(),
             timeout_secs: c.api_timeout_secs.max(1),
             max_width: c.api_max_width.max(1),
@@ -577,10 +577,18 @@ impl GatewayOcrClient {
         if !self.api_key.is_empty() {
             req = req.bearer_auth(&self.api_key);
         }
+        let started = std::time::Instant::now();
         let response = req
             .send()
             .await
-            .map_err(|e| CoreError::Ocr(format!("gateway OCR request failed: {e}")))?;
+            // Debug-format (`{e:?}`): reqwest's Display drops the source chain,
+            // hiding timeout vs reset vs TLS. Elapsed disambiguates timeouts.
+            .map_err(|e| {
+                CoreError::Ocr(format!(
+                    "gateway OCR request failed after {:?}: {e:?}",
+                    started.elapsed()
+                ))
+            })?;
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
@@ -599,15 +607,7 @@ impl GatewayOcrClient {
     }
 }
 
-/// Gateway root: trim slashes and a trailing `/v1` so both `https://host`
-/// and `https://host/v1` resolve to the same root.
-fn gateway_ocr_root(base: &str) -> String {
-    let s = base.trim_end_matches('/').to_string();
-    match s.strip_suffix("/v1") {
-        Some(root) => root.trim_end_matches('/').to_string(),
-        None => s,
-    }
-}
+/// Gateway root is shared with the embedding client (`crate::embedding`).
 
 /// Minimal `multipart/form-data` encoder for a single `file` field.
 /// Hand-rolled so the gateway path adds no dependency (reqwest `multipart`
