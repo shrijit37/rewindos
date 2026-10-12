@@ -77,7 +77,9 @@ pub struct OcrConfig {
     pub api_key: String,
     /// Vision-capable chat model, e.g. "gpt-4o-mini".
     pub api_model: String,
-    /// Per-request HTTP timeout for API OCR.
+    /// Per-request HTTP timeout for API OCR. Generous (120s) because vision
+    /// OCR on a remote endpoint routinely exceeds 30s — the gateway measured
+    /// ~50s per screenshot, which a 30s timeout truncates into a send failure.
     pub api_timeout_secs: u64,
     /// Screenshots wider than this are downscaled before upload.
     pub api_max_width: u32,
@@ -278,7 +280,7 @@ impl Default for OcrConfig {
             api_base_url: String::new(),
             api_key: String::new(),
             api_model: String::new(),
-            api_timeout_secs: 30,
+            api_timeout_secs: 120,
             api_max_width: 1600,
         }
     }
@@ -745,7 +747,7 @@ embedding_dimensions = 768
         assert!(config.ocr.api_base_url.is_empty());
         assert!(config.ocr.api_key.is_empty());
         assert!(config.ocr.api_model.is_empty());
-        assert_eq!(config.ocr.api_timeout_secs, 30);
+        assert_eq!(config.ocr.api_timeout_secs, 120);
         assert_eq!(config.ocr.api_max_width, 1600);
         assert_eq!(config.semantic.provider, "ollama");
         assert!(config.semantic.api_base_url.is_empty());

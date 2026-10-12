@@ -135,11 +135,14 @@ export function OCRTab({ config, update }: TabProps) {
               </>
             </Field>
           )}
-          <Field label="Timeout (seconds)">
+          <Field
+            label="Timeout (seconds)"
+            hint="Remote OCR often needs 60s+; raise this if requests time out."
+          >
             <NumberInput
               value={config.ocr.api_timeout_secs}
               min={5}
-              max={300}
+              max={600}
               onChange={(v) => update("ocr", "api_timeout_secs", v)}
             />
           </Field>
