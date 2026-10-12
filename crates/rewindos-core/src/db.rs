@@ -1481,11 +1481,19 @@ impl Database {
     /// Upsert, not insert: a re-run over a row that still holds a vector (a
     /// partially-completed backfill, or a status flag lost to a crash) must
     /// overwrite it, not abort the whole command on the conflict.
+    ///
+    /// The delete is explicit because `ocr_embeddings` is a sqlite-vec
+    /// virtual table — it raises its own `UNIQUE constraint failed on
+    /// ocr_embeddings primary key` and ignores `INSERT OR REPLACE`.
     pub fn insert_embedding(&self, screenshot_id: i64, embedding: &[f32]) -> Result<()> {
         let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
-            "INSERT OR REPLACE INTO ocr_embeddings (screenshot_id, embedding)
+            "DELETE FROM ocr_embeddings WHERE screenshot_id = ?1",
+            params![screenshot_id],
+        )?;
+        tx.execute(
+            "INSERT INTO ocr_embeddings (screenshot_id, embedding)
              VALUES (?1, ?2)",
             params![screenshot_id, blob],
         )?;
