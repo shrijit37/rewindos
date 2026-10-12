@@ -341,16 +341,19 @@ loop {
 ### Behavior
 
 ```
-// Spawned once on daemon startup if Ollama is available
+// Spawned once on daemon startup if the embedding backend is available
+cursor = 0
 loop {
-    pending = db.get_pending_embeddings(batch_size=50)
+    pending = db.get_pending_embeddings(after_id=cursor, limit=50)
     if pending.is_empty() { break }  // All caught up
+    cursor = last id in pending     // Rows return to 'pending' on failure;
+                                    // without this the loop never ends
 
     for (screenshot_id, text) in pending {
-        embedding = ollama_client.embed(text).await
-        if embedding is None { return }  // Ollama went away
+        embedding = client.embed(text).await
+        if embedding is None { return }  // Backend went away
         db.insert_embedding(screenshot_id, embedding)
-        sleep(50ms)  // Don't overwhelm Ollama
+        sleep(50ms)  // Don't overwhelm the backend
     }
 }
 log("backfill complete, processed N screenshots")
@@ -360,10 +363,35 @@ log("backfill complete, processed N screenshots")
 
 - **Batch size**: 50 screenshots per DB query
 - **Rate limiting**: 50ms delay between individual embeddings
-- **Graceful degradation**: If Ollama becomes unavailable mid-backfill, stops silently
-- **Idempotent**: Only processes `embedding_status = 'pending'` rows
+- **Graceful degradation**: If the backend becomes unavailable mid-backfill, stops silently
+- **Idempotent**: Only processes `embedding_status = 'pending'` rows; `insert_embedding`
+  upserts, so re-running never conflicts on an existing vector
+- **Lossless failures**: A failed embed leaves the row `pending` (never `failed`), so the
+  next daemon start retries it instead of dropping the screenshot from semantic search
+- **Terminates**: An id cursor advances past each batch — failed rows stay selectable, so
+  without it a single bad row would be retried forever
 - **Non-blocking**: Runs independently of the capture pipeline
 - **CLI alternative**: `cargo run -p rewindos-daemon -- backfill --batch-size 50`
+
+## OCR Backfill
+
+`rewindos-daemon backfill-ocr` re-runs OCR over existing screenshots — used when switching
+engines (e.g. Tesseract → gateway) to regenerate text with a better engine.
+
+It is **non-destructive**: OCR runs first and the result is written with
+`replace_ocr_data`, a single transaction that swaps the FTS entry, text, bounding boxes,
+embedding, and status flags together. Previously the old data was deleted *before* OCR
+ran, so one remote timeout permanently destroyed text that had been indexed days earlier.
+A failure now costs only a status change — the previous text stays searchable.
+
+- **Queue**: `ocr_status IN ('pending', 'done', 'failed')`, excluding `processing`, which
+  the live pipeline owns. `pending` is included because the pipeline only serves frames
+  still in memory — screenshots captured while OCR was disabled are otherwise unreachable
+  by any backfill.
+- **Id cursor**: same termination rule as the embedding backfill.
+- **Rebuilds embeddings**: replacing OCR text invalidates the vector describing it, so the
+  row is re-queued (`embedding_status = 'pending'`) rather than left stale. Follow up with
+  `rewindos-daemon backfill`.
 
 ## Shutdown Sequence
 
