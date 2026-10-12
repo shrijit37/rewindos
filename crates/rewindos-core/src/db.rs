@@ -604,6 +604,13 @@ impl Database {
     pub fn insert_transcript_embedding(&self, segment_id: i64, embedding: &[f32]) -> Result<()> {
         let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
         let tx = self.conn.unchecked_transaction()?;
+        // Explicit delete, not INSERT OR REPLACE: `transcript_embeddings` is a
+        // sqlite-vec virtual table and enforces its own primary key, so a
+        // re-embed of an already-embedded segment would abort the caller.
+        tx.execute(
+            "DELETE FROM transcript_embeddings WHERE segment_id = ?1",
+            params![segment_id],
+        )?;
         tx.execute(
             "INSERT INTO transcript_embeddings (segment_id, embedding) VALUES (?1, ?2)",
             params![segment_id, blob],
