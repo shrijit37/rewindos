@@ -210,12 +210,16 @@ async fn run_backfill(batch_size: usize) -> anyhow::Result<()> {
     println!("Connected ({}), starting backfill...", client.model());
 
     let mut total_processed = 0u64;
+    let mut cursor: i64 = 0;
 
     loop {
-        let pending = db.get_pending_embeddings(batch_size)?;
+        let pending = db.get_pending_embeddings(cursor, batch_size)?;
         if pending.is_empty() {
             break;
         }
+        // A row that fails to embed stays 'pending'; without advancing past
+        // it the loop would retry the same row forever.
+        cursor = pending.last().map(|(id, _)| *id).unwrap_or(cursor);
 
         let batch_total = pending.len();
 
@@ -232,9 +236,12 @@ async fn run_backfill(batch_size: usize) -> anyhow::Result<()> {
                 }
                 Ok(None) => {
                     eprintln!("\nEmbedding backend became unavailable, stopping.");
+                    println!("\nBackfill stopped. Processed {total_processed} screenshots.");
                     return Ok(());
                 }
                 Err(e) => {
+                    // Keep 'pending' so a later run retries it, and continue:
+                    // one malformed screenshot must not abandon the queue.
                     eprintln!("\nFailed to embed screenshot #{screenshot_id}: {e}");
                 }
             }
@@ -320,16 +327,23 @@ async fn run_backfill_ocr(batch_size: usize) -> anyhow::Result<()> {
     let consecutive_errors = Arc::new(AtomicU64::new(0));
     let abort_flag = Arc::new(AtomicBool::new(false));
     let worker_idx = Arc::new(AtomicU64::new(0));
+    let mut cursor: i64 = 0;
 
     'outer: loop {
         if abort_flag.load(Ordering::Relaxed) {
             break;
         }
 
-        let pending = db.lock().unwrap().get_screenshots_for_ocr_backfill(batch_size)?;
+        let pending = db
+            .lock()
+            .unwrap()
+            .get_screenshots_for_ocr_backfill(cursor, batch_size)?;
         if pending.is_empty() {
             break;
         }
+        // Advance past this batch: rows return to 'done' once processed, so
+        // without the cursor they would be selected again on every pass.
+        cursor = pending.last().map(|(id, _)| *id).unwrap_or(cursor);
 
         let batch_total = pending.len();
         let mut handles = Vec::with_capacity(batch_total);
@@ -360,15 +374,10 @@ async fn run_backfill_ocr(batch_size: usize) -> anyhow::Result<()> {
                     i + 1,
                 );
 
-                // Clear old OCR data (Tesseract results, embeddings)
-                {
-                    let db = db.lock().unwrap();
-                    if let Err(e) = db.clear_ocr_data(screenshot_id) {
-                        eprintln!("\nFailed to clear OCR data for #{screenshot_id}: {e}");
-                        total_errors.fetch_add(1, Ordering::Relaxed);
-                        return;
-                    }
-                }
+                // No pre-emptive clear: the previous text/boxes/embedding stay
+                // searchable until a successful OCR replaces them atomically.
+                // Clearing first meant one remote timeout permanently erased
+                // OCR results that had been indexed for weeks.
 
                 // Re-run OCR (remote endpoint in API/gateway modes, sidecar otherwise)
                 let ocr_result = if let Some(api) = &api {
@@ -384,23 +393,23 @@ async fn run_backfill_ocr(batch_size: usize) -> anyhow::Result<()> {
                     Ok(output) => {
                         consecutive_errors.store(0, Ordering::Relaxed);
                         let db = db.lock().unwrap();
-                        if let Err(e) = db.insert_ocr_text(screenshot_id, &output.full_text, output.word_count) {
-                            eprintln!("\nFailed to insert OCR text for #{screenshot_id}: {e}");
+                        if let Err(e) = db.replace_ocr_data(
+                            screenshot_id,
+                            &output.full_text,
+                            output.word_count,
+                            &output.bounding_boxes,
+                        ) {
+                            // Old data is intact — only the status write failed.
+                            eprintln!("\nFailed to store OCR for #{screenshot_id}: {e}");
                             total_errors.fetch_add(1, Ordering::Relaxed);
-                            db.update_ocr_status(screenshot_id, OcrStatus::Failed).ok();
-                            return;
                         }
-                        if !output.bounding_boxes.is_empty() {
-                            if let Err(e) = db.insert_bounding_boxes(screenshot_id, &output.bounding_boxes) {
-                                eprintln!("\nFailed to insert bounding boxes for #{screenshot_id}: {e}");
-                            }
-                        }
-                        db.update_ocr_status(screenshot_id, OcrStatus::Done).ok();
                     }
                     Err(e) => {
                         eprintln!("\n{label} failed for #{screenshot_id}: {e}");
                         total_errors.fetch_add(1, Ordering::Relaxed);
                         let errs = consecutive_errors.fetch_add(1, Ordering::Relaxed) + 1;
+                        // Status only. The screenshot keeps whatever text it
+                        // already had, so a failed re-run costs nothing.
                         db.lock().unwrap().update_ocr_status(screenshot_id, OcrStatus::Failed).ok();
                         if errs >= 3 {
                             eprintln!("3 consecutive failures — aborting. Fix the {label} setup and retry.");
@@ -880,10 +889,11 @@ async fn run_daemon() -> anyhow::Result<()> {
         tokio::spawn(async move {
             info!("starting background embedding backfill");
             let mut total = 0u64;
+            let mut cursor: i64 = 0;
             loop {
                 let pending = {
                     let db = backfill_db.lock().unwrap_or_else(|e| e.into_inner());
-                    match db.get_pending_embeddings(50) {
+                    match db.get_pending_embeddings(cursor, 50) {
                         Ok(p) => p,
                         Err(e) => {
                             warn!(error = %e, "backfill: failed to get pending embeddings");
@@ -898,6 +908,9 @@ async fn run_daemon() -> anyhow::Result<()> {
                     }
                     break;
                 }
+                // Rows that fail below stay 'pending' and would otherwise be
+                // re-fetched on every pass, looping forever on one bad row.
+                cursor = pending.last().map(|(id, _)| *id).unwrap_or(cursor);
 
                 for (screenshot_id, text) in pending {
                     match backfill_client.embed(&text, backfill_dims).await {
@@ -915,9 +928,11 @@ async fn run_daemon() -> anyhow::Result<()> {
                             return;
                         }
                         Err(e) => {
-                            warn!(screenshot_id, error = %e, "backfill: failed to embed");
-                            let db = backfill_db.lock().unwrap_or_else(|e| e.into_inner());
-                            let _ = db.mark_embedding_failed(screenshot_id);
+                            // Transient (network, endpoint down): leave the row
+                            // 'pending' so the next daemon start retries it.
+                            // Marking it 'failed' would silently drop the
+                            // screenshot from semantic search for good.
+                            warn!(screenshot_id, error = %e, "backfill: failed to embed, will retry");
                         }
                     }
                     // Small delay to avoid overwhelming Ollama

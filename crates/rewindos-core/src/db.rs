@@ -707,10 +707,22 @@ impl Database {
         Ok(())
     }
 
-    /// Delete all OCR data for a screenshot (text, FTS5 entry, bounding boxes)
-    /// and reset both ocr_status and embedding_status to 'pending'.
-    /// Used by backfill-ocr to clear old Tesseract results before re-processing.
-    pub fn clear_ocr_data(&self, screenshot_id: i64) -> Result<()> {
+    /// Atomically replace every piece of OCR-derived state for a screenshot:
+    /// FTS entry, text, bounding boxes, and the now-stale embedding, plus both
+    /// status flags. One transaction, so a crash or an error mid-write leaves
+    /// either the complete old data or the complete new data — never a
+    /// screenshot that is searchable by neither.
+    ///
+    /// Backfill calls this *after* OCR succeeds. Clearing first (the old
+    /// behaviour) made a single remote timeout destroy text that had been
+    /// indexed days earlier, with no way to recover it.
+    pub fn replace_ocr_data(
+        &self,
+        screenshot_id: i64,
+        text: &str,
+        word_count: i32,
+        boxes: &[NewBoundingBox],
+    ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "DELETE FROM ocr_fts WHERE screenshot_id = ?1",
@@ -724,27 +736,73 @@ impl Database {
             "DELETE FROM ocr_bounding_boxes WHERE screenshot_id = ?1",
             params![screenshot_id],
         )?;
+        // The vector described the old text; keeping it would rank this
+        // screenshot against text that no longer exists.
         tx.execute(
             "DELETE FROM ocr_embeddings WHERE screenshot_id = ?1",
             params![screenshot_id],
         )?;
         tx.execute(
-            "UPDATE screenshots SET ocr_status = 'pending', embedding_status = 'pending' WHERE id = ?1",
+            "INSERT INTO ocr_text_content (screenshot_id, text_content, word_count)
+             VALUES (?1, ?2, ?3)",
+            params![screenshot_id, text, word_count],
+        )?;
+        tx.execute(
+            "INSERT INTO ocr_fts (text_content, screenshot_id)
+             VALUES (?1, ?2)",
+            params![text, screenshot_id],
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO ocr_bounding_boxes (screenshot_id, text_content, x, y, width, height, confidence)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for b in boxes {
+                stmt.execute(params![
+                    screenshot_id,
+                    b.text_content,
+                    b.x,
+                    b.y,
+                    b.width,
+                    b.height,
+                    b.confidence,
+                ])?;
+            }
+        }
+        tx.execute(
+            "UPDATE screenshots SET ocr_status = 'done', embedding_status = 'pending'
+             WHERE id = ?1",
             params![screenshot_id],
         )?;
         tx.commit()?;
         Ok(())
     }
 
-    /// Get screenshots that need OCR re-processing (already processed by Tesseract).
-    /// Returns (screenshot_id, file_path) for screenshots with ocr_status 'done' or 'failed'.
-    pub fn get_screenshots_for_ocr_backfill(&self, limit: usize) -> Result<Vec<(i64, String)>> {
+    /// Get screenshots that need OCR: never processed ('pending'), previously
+    /// processed and worth redoing ('done'), or previously failed ('failed').
+    /// 'processing' is excluded — the live pipeline owns those rows, and the
+    /// two paths must not write the same screenshot concurrently.
+    ///
+    /// 'pending' is included deliberately: the pipeline only ever handles
+    /// frames still in memory, so rows captured while OCR was disabled (or
+    /// lost to an old crash) stay 'pending' forever and are otherwise
+    /// unreachable by any backfill.
+    ///
+    /// `after_id` is a cursor: backfill re-runs the same rows repeatedly (they
+    /// return to 'done' after a successful pass), so without it the command
+    /// re-processes every screenshot forever and never terminates.
+    pub fn get_screenshots_for_ocr_backfill(
+        &self,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<Vec<(i64, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, file_path FROM screenshots
-             WHERE ocr_status IN ('done', 'failed')
-             ORDER BY id LIMIT ?1",
+             WHERE ocr_status IN ('pending', 'done', 'failed')
+               AND id > ?1
+             ORDER BY id LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![limit as i64], |row| {
+        let rows = stmt.query_map(params![after_id, limit as i64], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?;
         let mut results = Vec::new();
@@ -1419,11 +1477,15 @@ impl Database {
     /// Transactional: the vector row and the status flag must move together,
     /// or a crash leaves the screenshot permanently 'pending' with a vector
     /// row already present — the backfill loop then UNIQUE-conflicts forever.
+    ///
+    /// Upsert, not insert: a re-run over a row that still holds a vector (a
+    /// partially-completed backfill, or a status flag lost to a crash) must
+    /// overwrite it, not abort the whole command on the conflict.
     pub fn insert_embedding(&self, screenshot_id: i64, embedding: &[f32]) -> Result<()> {
         let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
-            "INSERT INTO ocr_embeddings (screenshot_id, embedding)
+            "INSERT OR REPLACE INTO ocr_embeddings (screenshot_id, embedding)
              VALUES (?1, ?2)",
             params![screenshot_id, blob],
         )?;
@@ -1447,18 +1509,22 @@ impl Database {
     }
 
     /// Get screenshots that have OCR text but no embedding yet.
-    pub fn get_pending_embeddings(&self, limit: usize) -> Result<Vec<(i64, String)>> {
+    ///
+    /// `after_id` is a cursor for the same reason as the OCR backfill: a row
+    /// whose embed failed stays 'pending', so without it one bad row is
+    /// retried forever and the command never finishes.
+    pub fn get_pending_embeddings(&self, after_id: i64, limit: usize) -> Result<Vec<(i64, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT s.id, otc.text_content
              FROM screenshots s
              JOIN ocr_text_content otc ON otc.screenshot_id = s.id
              WHERE s.ocr_status = 'done'
                AND s.embedding_status = 'pending'
-             ORDER BY s.id
-             LIMIT ?1",
+               AND s.id > ?1
+             LIMIT ?2",
         )?;
 
-        let rows = stmt.query_map(params![limit as i64], |row| {
+        let rows = stmt.query_map(params![after_id, limit as i64], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?;
 
@@ -3993,7 +4059,7 @@ mod tests {
 
         db.insert_embedding(id, &[0.1_f32; 768]).unwrap();
 
-        let pending = db.get_pending_embeddings(10).unwrap();
+        let pending = db.get_pending_embeddings(0, 10).unwrap();
         assert!(
             !pending.iter().any(|(pid, _)| *pid == id),
             "screenshot must leave the pending queue once embedded"
@@ -4075,5 +4141,124 @@ mod tests {
         let mut names = db.distinct_app_names().unwrap();
         names.sort();
         assert_eq!(names, vec!["Dolphin".to_string(), "firefox".to_string()]);
+    }
+
+    /// Keyword-only filters — enough to exercise the FTS leg.
+    fn kw(query: &str) -> SearchFilters {
+        SearchFilters {
+            query: query.to_string(),
+            start_time: None,
+            end_time: None,
+            app_name: None,
+            limit: 10,
+            offset: 0,
+        }
+    }
+
+    #[test]
+    fn replace_ocr_data_swaps_all_state_together() {
+        let db = make_test_db();
+        let id = db.insert_screenshot(&make_screenshot(1000)).unwrap();
+        db.insert_ocr_text(id, "old text", 2).unwrap();
+        db.insert_embedding(id, &[0.5_f32; 768]).unwrap();
+
+        let boxes = [NewBoundingBox {
+            text_content: "new".to_string(),
+            x: 1,
+            y: 2,
+            width: 3,
+            height: 4,
+            confidence: Some(0.9),
+        }];
+        db.replace_ocr_data(id, "new text", 2, &boxes).unwrap();
+
+        // The old keyword must be gone, the new one searchable, and the
+        // vector invalidated — it described the text that no longer exists.
+        assert!(db.search(&kw("old")).unwrap().results.is_empty());
+        let hits = db.search(&kw("new")).unwrap();
+        assert_eq!(hits.results.len(), 1);
+        assert_eq!(hits.results[0].id, id);
+        let ss = db.get_screenshot(id).unwrap().unwrap();
+        assert_eq!(ss.ocr_status, OcrStatus::Done);
+        assert_eq!(db.get_bounding_boxes(id).unwrap().len(), 1);
+        // Re-queued for embedding rather than left holding a stale vector.
+        assert_eq!(db.get_pending_embeddings(0, 10).unwrap().len(), 1);
+        let vectors: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM ocr_embeddings WHERE screenshot_id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(vectors, 0, "vector described the replaced text");
+    }
+
+    #[test]
+    fn ocr_backfill_cursor_advances_past_processed_rows() {
+        let db = make_test_db();
+        for ts in [1000, 2000, 3000] {
+            let id = db.insert_screenshot(&make_screenshot(ts)).unwrap();
+            db.insert_ocr_text(id, "text", 1).unwrap();
+            db.update_ocr_status(id, OcrStatus::Done).unwrap();
+        }
+
+        let first = db.get_screenshots_for_ocr_backfill(0, 2).unwrap();
+        assert_eq!(first.len(), 2);
+        // Without the cursor these same 'done' rows return on every pass.
+        let cursor = first.last().unwrap().0;
+        let second = db.get_screenshots_for_ocr_backfill(cursor, 2).unwrap();
+        assert_eq!(second.len(), 1);
+        assert!(second[0].0 > cursor);
+    }
+
+    #[test]
+    fn ocr_backfill_includes_never_processed_rows() {
+        let db = make_test_db();
+        let id = db.insert_screenshot(&make_screenshot(1000)).unwrap();
+        assert_eq!(
+            db.get_screenshot(id).unwrap().unwrap().ocr_status,
+            OcrStatus::Pending
+        );
+
+        let queued = db.get_screenshots_for_ocr_backfill(0, 10).unwrap();
+        assert_eq!(queued.len(), 1, "pending rows are the bulk of an unbackfilled library");
+    }
+
+    #[test]
+    fn ocr_backfill_skips_rows_the_pipeline_is_processing() {
+        let db = make_test_db();
+        let id = db.insert_screenshot(&make_screenshot(1000)).unwrap();
+        db.update_ocr_status(id, OcrStatus::Processing).unwrap();
+        assert!(db.get_screenshots_for_ocr_backfill(0, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn insert_embedding_is_idempotent_across_reruns() {
+        let db = make_test_db();
+        let id = db.insert_screenshot(&make_screenshot(1000)).unwrap();
+        db.insert_ocr_text(id, "text", 1).unwrap();
+        // A second pass over the same row must overwrite, not conflict.
+        db.insert_embedding(id, &[0.5_f32; 768]).unwrap();
+        db.insert_embedding(id, &[0.25_f32; 768]).unwrap();
+
+        let status: String = db
+            .conn()
+            .query_row(
+                "SELECT embedding_status FROM screenshots WHERE id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "done");
+        let vectors: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM ocr_embeddings WHERE screenshot_id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(vectors, 1, "re-embedding must replace, not duplicate");
     }
 }
